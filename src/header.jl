@@ -63,7 +63,12 @@ end
 """
     parse_header(path::String) -> PkgImageHeader
 
-Parse the header of a `.ji` package image file. Does not read the data blob.
+Parse the header of a `.ji` or `.so` package image file.
+
+For `.ji` files, reads the header directly from the file.
+For `.so`/`.dylib`/`.dll` files (split images), loads the shared library via
+`Libdl.dlopen`, locates the embedded JI header via `jl_image_pointers`, and
+parses it from memory.
 
 The parser replicates the binary format from:
 - `write_header` (staticdata_utils.c:505-523)
@@ -72,12 +77,103 @@ The parser replicates the binary format from:
 - `_parse_cache_header` (base/loading.jl:3430-3491)
 
 # Throws
-- `ArgumentError` if the file is not a valid `.ji` file
+- `ArgumentError` if the file is not a valid Julia package image
 """
 function parse_header(path::String)
+    if _is_shared_library(path)
+        return _parse_so_header(path)
+    end
     open(path, "r") do io
         return _parse_header_from_io(io, path)
     end
+end
+
+const _SO_EXTENSIONS = (".so", ".dylib", ".dll")
+
+function _is_shared_library(path::String)
+    lp = lowercase(path)
+    return any(ext -> endswith(lp, ext), _SO_EXTENSIONS)
+end
+
+function _parse_so_header(path::String)
+    # The .so embeds a JI header written by write_header(ff, 1) at staticdata.c:3530
+    # followed by cache_flags and write_mod_list. It lives inside an ELF/MachO/PE
+    # data section (jl_system_image_data). We locate it by scanning for the JI_MAGIC
+    # signature with pkgimage=1.
+    return _parse_so_header_by_scan(path)
+end
+
+function _parse_so_header_by_scan(path::String)
+    # The .so's own JI header is written by write_header(ff, 1) at staticdata.c:3530
+    # with pkgimage=1, followed by cache_flags and write_mod_list.
+    # It also embeds the .ji data blob (which starts with pkgimage=0 header).
+    # We need the .so's OWN header (pkgimage=1), not the embedded .ji data.
+    data = read(path)
+
+    # Scan for JI_MAGIC followed by valid format_version, BOM, and pkgimage=1
+    offset = 1
+    while true
+        idx = _find_bytes(data, JI_MAGIC, offset)
+        idx === nothing && throw(ArgumentError("No JI header (pkgimage=1) found in shared library: $path"))
+
+        # Check: magic(8) + version(2) + bom(2) + ptrsize(1) = 13 bytes minimum after magic
+        if idx + JI_MAGIC_LEN + 13 > length(data)
+            offset = idx + 1
+            continue
+        end
+
+        # Try parsing — if it's the right header (pkgimage=1), return it
+        try
+            io = IOBuffer(@view data[idx:end])
+            hdr = _parse_header_from_io(io, path)
+            if hdr.pkgimage
+                # _parse_header_from_io recorded byte offsets via position(io),
+                # which are RELATIVE to the IOBuffer view (i.e. to `idx`). Shift
+                # them to ABSOLUTE file offsets so remap() patches the correct
+                # bytes in the .so instead of clobbering the ELF/MachO headers.
+                return _shift_header_offsets(hdr, idx - 1)
+            end
+        catch
+            # Not a valid header at this offset — keep scanning
+        end
+
+        offset = idx + 1
+    end
+end
+
+# Return a copy of `hdr` with all recorded file offsets shifted by `base`.
+# Used to convert .so-relative offsets (parsed from an IOBuffer view) into
+# absolute file offsets. (DepModEntry/WorklistEntry are immutable → rebuild.)
+function _shift_header_offsets(hdr::PkgImageHeader, base::Int)
+    base == 0 && return hdr
+    wl = WorklistEntry[WorklistEntry(w.name, w.uuid, w.build_id_lo, w._file_offset + base)
+                       for w in hdr.worklist]
+    rm = DepModEntry[DepModEntry(d.name, d.uuid, d.build_id_hi, d.build_id_lo,
+                                 d._file_offset_hi + base, d._file_offset_lo + base)
+                     for d in hdr.required_modules]
+    return PkgImageHeader(
+        hdr.format_version, hdr.pointer_size, hdr.build_uname, hdr.build_arch,
+        hdr.julia_version, hdr.git_branch, hdr.git_commit, hdr.pkgimage, hdr.checksum,
+        hdr.data_start, hdr.data_end, hdr.cache_flags, wl, rm,
+        hdr._deplist_start, hdr._deplist_end, hdr._path,
+    )
+end
+
+function _find_bytes(haystack::Vector{UInt8}, needle::Vector{UInt8}, start::Int=1)
+    nlen = length(needle)
+    hlen = length(haystack)
+    nlen > hlen && return nothing
+    for i in start:(hlen - nlen + 1)
+        match = true
+        for j in 1:nlen
+            if haystack[i + j - 1] != needle[j]
+                match = false
+                break
+            end
+        end
+        match && return i
+    end
+    return nothing
 end
 
 function _parse_header_from_io(io::IO, path::String)
@@ -105,30 +201,38 @@ function _parse_header_from_io(io::IO, path::String)
     data_start = read(io, Int64)
     data_end = read(io, Int64)
 
-    # ── Section 1: Cache flags (staticdata.c:3468) ──
+    # ── Section 1: Cache flags (staticdata.c:3468 / 3531) ──
 
     cache_flags = read(io, UInt8)
 
-    # ── Section 2: Worklist (write_worklist_for_header, staticdata_utils.c:531) ──
+    # The .so split-image header (pkgimage=1) has a DIFFERENT, simpler format
+    # than the .ji incremental header (pkgimage=0):
+    #
+    #   .ji (pkgimage=0):  base_header + cache_flags + worklist + deplist + mod_list
+    #   .so (pkgimage=1):  base_header + cache_flags + mod_list
+    #
+    # See staticdata.c:3528-3532 for the split-image header vs 3465-3481 for .ji.
 
-    worklist = _read_module_list(io, false)
+    worklist = WorklistEntry[]
+    deplist_start = Int64(0)
+    deplist_end = Int64(0)
 
-    # ── Section 3: Dependency list (write_dependency_list, staticdata_utils.c:563) ──
-    # This section has variable format. The Julia-side parser reads totbytes
-    # to know how much to skip. We read totbytes, then skip that many bytes
-    # minus the 8 bytes we already read for totbytes itself.
+    if pkgimage_flag == 0
+        # ── .ji format: Sections 2-4 ──
 
-    deplist_start = position(io)
-    totbytes = read(io, UInt64)
-    # totbytes counts from after itself to the end of the dependency list section
-    # (includes file records, requires, preferences)
-    if totbytes > 0
-        skip(io, totbytes)
+        # Section 2: Worklist (write_worklist_for_header, staticdata_utils.c:531)
+        worklist = _read_module_list(io, false)
+
+        # Section 3: Dependency list (write_dependency_list, staticdata_utils.c:563)
+        deplist_start = position(io)
+        totbytes = read(io, UInt64)
+        if totbytes > 0
+            skip(io, totbytes)
+        end
+        deplist_end = position(io)
     end
-    deplist_end = position(io)
 
-    # ── Section 4: Required modules (write_mod_list, staticdata_utils.c:409) ──
-
+    # Section 4 (.ji) / Section 2 (.so): Required modules (write_mod_list)
     required_modules = _read_module_list(io, true)
 
     return PkgImageHeader(
