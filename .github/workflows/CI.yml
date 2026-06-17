@@ -1,0 +1,42 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.12'
+        os:
+          - ubuntu-latest
+        arch:
+          - x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      # NOTE: Several tests scan Base.DEPOT_PATH for real package-image
+      # fixtures (.ji / .so files under compiled/v1.12). A clean CI runner
+      # has no precompiled depot, so those tests skip or assert out unless a
+      # precompiled-depot fixture is provisioned (e.g. precompile a package,
+      # or cache/restore a depot before this step). See test/ for the
+      # find_so()/walkdir(compiled_dir) helpers that locate the fixtures.
+      - uses: julia-actions/julia-runtest@v1
