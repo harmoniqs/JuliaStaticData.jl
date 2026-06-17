@@ -116,7 +116,7 @@ function load_package_image(path::String;
 
     if register
         pkg = _infer_pkgid(hdr)
-        restored = Base.register_restored_modules(sv, pkg, path)
+        restored = @lock Base.require_lock Base.register_restored_modules(sv, pkg, path)
 
         if !run_init
             # register_restored_modules already ran __init__; we can't undo that.

@@ -1,0 +1,5 @@
+/Manifest.toml
+/csrc/build/
+/docs/build/
+*.o
+*.cov

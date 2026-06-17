@@ -1,0 +1,173 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    # ---------------------------------------------------------------------------
+    # Package-image fixture for the depot-dependent tests.
+    #
+    # Several tests need a REAL pkgimage fixture (.ji + .so under
+    # compiled/v<major>.<minor>). Locally they scan Base.DEPOT_PATH; in CI we
+    # provision the exact Piccolissimo BuildImage bundle (its `target/pkgimage/`
+    # depot) from R2 and point the tests at it via JSD_FIXTURE_DEPOT. Without a
+    # bundle the tests SKIP (green), so this whole mechanism is best-effort.
+    #
+    # Required repo secrets (R2 read access to bucket `harmoniqs-binaries`):
+    #   R2_ACCOUNT_ID         -> endpoint https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
+    #   R2_ACCESS_KEY_ID      -> S3 access key id
+    #   R2_SECRET_ACCESS_KEY  -> S3 secret access key
+    # When R2_ACCESS_KEY_ID is empty/unset (e.g. on forks) HAVE_R2 is 'false' and
+    # the download step is skipped entirely; the fixture tests then skip.
+    #
+    # DEPENDENCY: a published bundle must exist. BuildImage.yml (in the
+    # Piccolissimo repo) uploads tarballs to
+    #   s3://harmoniqs-binaries/piccolissimo/pkgimage/...
+    # Until a bundle for the runner's (platform, julia<patch>) has been published,
+    # this step finds nothing, logs a warning, and the fixture tests skip.
+    #
+    # PRODUCER-SIDE TODO (separate Piccolissimo change, NOT in this repo): publish
+    # a STABLE pointer object at
+    #   piccolissimo/pkgimage/fixtures/julia<patch>/latest.tar.zst
+    # for each supported Julia patch so this step does not have to parse the
+    # manifest. Until that key exists, the manifest.json fallback below is used.
+    # ---------------------------------------------------------------------------
+    env:
+      # Derived solely from a secret's presence so it is safe in `if:` (forks
+      # have no secrets -> 'false'). Note: secret VALUES are never compared in
+      # `if:`, only presence, so nothing sensitive leaks into logs.
+      HAVE_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' }}
+      R2_BUCKET: harmoniqs-binaries
+      R2_PREFIX: piccolissimo/pkgimage
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.12'
+        os:
+          - ubuntu-latest
+        arch:
+          - x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+
+      # Download + extract the Piccolissimo pkgimage bundle from R2 and export
+      # JSD_FIXTURE_DEPOT so the depot-dependent tests RUN instead of skipping.
+      # Gated on R2 secrets being present; best-effort (never fails the job).
+      - name: Provision pkgimage fixture from R2
+        if: env.HAVE_R2 == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          set -uo pipefail   # NOT -e: this step must never fail the job.
+
+          warn() { echo "::warning::pkgimage fixture: $*"; }
+
+          # Tools: awscli for S3-compatible R2 access; unzstd to extract.
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "Installing awscli..."
+            sudo apt-get update -y && sudo apt-get install -y awscli || {
+              warn "could not install awscli; fixture tests will skip"; exit 0; }
+          fi
+          if ! command -v unzstd >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y zstd || {
+              warn "could not install zstd; fixture tests will skip"; exit 0; }
+          fi
+
+          s3() { aws --endpoint-url "$R2_ENDPOINT" s3 "$@"; }
+          s3api() { aws --endpoint-url "$R2_ENDPOINT" s3api "$@"; }
+
+          # Identify the runner's Julia patch + platform to match a build.
+          JULIA_PATCH="$(julia -e 'print(VERSION)')"
+          # Base arch-os-libc triple (e.g. x86_64-linux-gnu) — the simple platform
+          # tag BuildImage names tarballs with. This deliberately drops the long
+          # ABI/julia_version suffix from BinaryPlatforms.triplet so it matches the
+          # `platform` field the producer writes into manifest.json / the filename.
+          # NOTE: the producer (Piccolissimo BuildImage) OWNS this string format;
+          # keep this in sync with how it names tarballs / manifest `platform`.
+          PLATFORM="$(julia -e '
+            import Base.BinaryPlatforms: HostPlatform, arch, os, libc
+            p = HostPlatform()
+            lc = something(libc(p), "")
+            lc == "glibc" && (lc = "gnu")   # normalize to BinaryBuilder convention
+            print(join(filter(!isempty, [arch(p), os(p), lc]), "-"))
+          ')"
+          echo "Looking for fixture: platform=$PLATFORM julia=$JULIA_PATCH"
+
+          TARBALL="$RUNNER_TEMP/jsd-fixture.tar.zst"
+
+          # 1) Preferred: a STABLE producer-published pointer key.
+          STABLE_KEY="$R2_PREFIX/fixtures/julia${JULIA_PATCH}/latest.tar.zst"
+          echo "Trying stable key s3://$R2_BUCKET/$STABLE_KEY ..."
+          if s3 cp "s3://$R2_BUCKET/$STABLE_KEY" "$TARBALL" >/dev/null 2>&1; then
+            echo "Got stable fixture."
+          else
+            # 2) Fallback: read manifest.json and pick the newest matching build.
+            echo "Stable key not found; falling back to manifest.json"
+            MANIFEST="$RUNNER_TEMP/pkgimage-manifest.json"
+            if ! s3 cp "s3://$R2_BUCKET/$R2_PREFIX/manifest.json" "$MANIFEST" >/dev/null 2>&1; then
+              warn "no stable fixture and no manifest.json (has BuildImage run?); skipping"
+              exit 0
+            fi
+            # manifest.json is expected to be a list of build records with at least
+            # { "platform": ..., "julia_version": ..., "key": ..., and a sortable
+            # recency field "created_at" (ISO-8601) or "build" }. Pick newest match
+            # using jq (installed if missing).
+            command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq >/dev/null 2>&1 || true
+            KEY=""
+            if command -v jq >/dev/null 2>&1; then
+              KEY="$(jq -r --arg plat "$PLATFORM" --arg jv "$JULIA_PATCH" '
+                [ .[] | select(.platform == $plat and .julia_version == $jv) ]
+                | sort_by(.created_at // .build // "")
+                | last
+                | .key // empty
+              ' "$MANIFEST" 2>/dev/null || true)"
+            else
+              warn "jq unavailable; cannot parse manifest.json; skipping"
+            fi
+            if [ -z "${KEY:-}" ]; then
+              warn "manifest.json has no build matching ($PLATFORM, julia$JULIA_PATCH); skipping"
+              exit 0
+            fi
+            echo "Selected manifest key: $KEY"
+            if ! s3 cp "s3://$R2_BUCKET/$KEY" "$TARBALL" >/dev/null 2>&1; then
+              warn "failed to download $KEY; skipping"
+              exit 0
+            fi
+          fi
+
+          # Extract: the tarball's top level IS the depot contents
+          # (compiled/v<major>.<minor>/...), so the extract dir becomes the depot.
+          DEPOT="$RUNNER_TEMP/jsd-fixture"
+          mkdir -p "$DEPOT"
+          if ! tar --use-compress-program=unzstd -xf "$TARBALL" -C "$DEPOT"; then
+            warn "failed to extract bundle; skipping"
+            exit 0
+          fi
+          echo "JSD_FIXTURE_DEPOT=$DEPOT" >> "$GITHUB_ENV"
+          echo "Provisioned fixture depot at $DEPOT:"
+          ls -R "$DEPOT" | head -n 40 || true
+
+      - uses: julia-actions/julia-runtest@v1
