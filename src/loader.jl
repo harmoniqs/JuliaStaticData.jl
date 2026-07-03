@@ -75,10 +75,13 @@ function load_package_image(path::String;
                             pkgname::Union{String,Nothing}=nothing)
     hdr = parse_header(path)
 
-    # Infer package name from worklist if not provided
+    # Infer package name from worklist if not provided. A split `.so` header has
+    # no worklist (it lives in the companion `.ji`), so fall back to that.
     if pkgname === nothing
-        isempty(hdr.worklist) && error("Cannot infer package name: worklist is empty in $path")
-        pkgname = hdr.worklist[end].name
+        wl = _effective_worklist(hdr, path)
+        isempty(wl) && error("Cannot infer package name: worklist is empty in $path " *
+                             "(and no companion .ji with a worklist was found)")
+        pkgname = wl[end].name
     end
 
     # Auto-resolve depmods from header if not provided
@@ -115,7 +118,7 @@ function load_package_image(path::String;
     sv = sv::Core.SimpleVector
 
     if register
-        pkg = _infer_pkgid(hdr)
+        pkg = _infer_pkgid(hdr, path)
         restored = @lock Base.require_lock Base.register_restored_modules(sv, pkg, path)
 
         if !run_init
@@ -153,9 +156,27 @@ end
 
 # ── Internal helpers ────────────────────────────────────────
 
-function _infer_pkgid(hdr::PkgImageHeader)
-    isempty(hdr.worklist) && error("Cannot infer PkgId: empty worklist")
-    w = hdr.worklist[end]
+# The worklist that identifies the package(s) in this image. A split `.so`
+# header carries none (it lives only in the companion `.ji`), so resolve it
+# from the sibling `.ji` when the header's own worklist is empty. This lets
+# `load_package_image(some.so)` work directly instead of erroring on pkgname /
+# PkgId inference.
+function _effective_worklist(hdr::PkgImageHeader, path::String)
+    isempty(hdr.worklist) || return hdr.worklist
+    if hdr.pkgimage || _is_shared_library(path)
+        ji = splitext(path)[1] * ".ji"
+        if isfile(ji) && abspath(ji) != abspath(path)
+            return parse_header(ji).worklist
+        end
+    end
+    return hdr.worklist
+end
+
+function _infer_pkgid(hdr::PkgImageHeader, path::String)
+    wl = _effective_worklist(hdr, path)
+    isempty(wl) && error("Cannot infer PkgId: empty worklist in $path " *
+                         "(and no companion .ji with a worklist was found)")
+    w = wl[end]
     return Base.PkgId(w.uuid, w.name)
 end
 
