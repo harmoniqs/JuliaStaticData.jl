@@ -1,0 +1,1036 @@
+"""
+Reference translation: re-point a private package image's cross-image references
+at a *consumer's own rebuild* of its dependencies, using live reflection on both
+sides instead of blob archaeology.
+
+This is the productization of the bundle-v2 research pipeline (Piccolissimo
+`experiments/bundle-v2-tracer`, legs 4-5). The flow:
+
+  builder (its own depot)                 consumer (its own depot)
+  ─────────────────────                   ────────────────────────
+  emit_sidecar(images) ───► Sidecar ────► translate!(image_copy, sidecar)
+                                          load_package_image(...)
+                                          canonicalize!(mod)
+
+Each pointer that crosses into another loaded image is serialized inline in the
+data blob as an 8-byte reloc *target word*
+(`(5<<61) | (depsidx<<40) | (byte_offset÷8)`, staticdata.c:1204/2170 @ v1.12.6).
+Refs into the sysimage (`depsidx == 0`) are stable across depots (identical Julia
+⇒ identical sys image) and need no translation — measured 98.8% of refs. Only
+refs into separately-precompiled *pkgimage* deps can shift.
+
+- [`emit_sidecar`](@ref): parse each private image's ref words, resolve each
+  pkgimage-dep target to the *live* object in the builder's own loaded deps (via
+  `jl_linkage_blobs` blob base + offset), and emit a semantic
+  [`RefDescriptor`](@ref) for it.
+- [`translate!`](@ref): resolve every descriptor to a live object in the
+  consumer's rebuilt deps, compute its new offset in the owning blob, rewrite the
+  word, and restamp the checksums (reusing the [`stamp_identity!`](@ref)
+  restamp internals).
+- [`canonicalize!`](@ref): the post-load type-hash repair (leg5 wall #5).
+- [`load_translated`](@ref): the top-level convenience chaining all of the above.
+"""
+
+# ── Reloc word / payload constants (staticdata.c @ v1.12.6) ──────────
+#
+# See leg4/RESULTS.md for the full payload layout map with source citations.
+const _RELOC_TAG_OFFSET = 61
+const _DEPS_IDX_OFFSET = 40
+const _SYS_EXTERNAL_LINK_UNIT = 8
+const _JL_CACHE_BYTE_ALIGNMENT = 64
+
+const _DATAREF = 0
+const _CONSTDATAREF = 1
+const _TAGREF = 2
+const _SYMBOLREF = 3
+const _FUNCTIONREF = 4
+const _SYSIMAGE_LINKAGE = 5
+const _EXTERNAL_LINKAGE = 6
+
+# ── Little-endian word helpers ───────────────────────────────────────
+
+@inline function _read_u32(P::Vector{UInt8}, off::Int)
+    return (UInt32(P[off + 1]) | UInt32(P[off + 2]) << 8 |
+            UInt32(P[off + 3]) << 16 | UInt32(P[off + 4]) << 24)
+end
+
+@inline function _read_u64le(P::Vector{UInt8}, off::Int)
+    v = UInt64(0)
+    @inbounds for k in 0:7
+        v |= UInt64(P[off + 1 + k]) << (8k)
+    end
+    return v
+end
+
+@inline function _write_u64le!(P::Vector{UInt8}, off::Int, v::UInt64)
+    @inbounds for k in 0:7
+        P[off + 1 + k] = UInt8((v >> (8k)) & 0xff)
+    end
+    return nothing
+end
+
+_align(x::Int, a::Int) = (x + a - 1) & ~(a - 1)
+
+# ── Payload section parse ────────────────────────────────────────────
+#
+# The CRC-covered payload spans header [data_start, data_end). We reuse JSD's
+# `parse_header`/`_image_layout` for the header, then walk the section chain
+# (`jl_save_system_image_to_stream`, staticdata.c:3338-3434) to locate the
+# gctags/relocs offsetlists and the gvar/delayed-root words — the sections that
+# can carry external reloc words. Ported from leg5/blobparse2.jl.
+
+struct _PayloadImage
+    bytes::Vector{UInt8}       # whole file
+    payload_base::Int          # 0-based file offset of payload byte 0
+    P::Vector{UInt8}           # payload copy (payload_base .. data_end)
+    blob_lo::Int               # 8
+    blob_hi::Int               # 8 + sizeof_sysdata
+    const_lo::Int
+    const_hi::Int              # sizeof_sysimg (linkage-blob end)
+    gctags::Vector{Int}
+    relocs::Vector{Int}
+    gvar_start::Int
+    ngvars::Int
+    external_fns_begin::Int
+    droot_start::Int
+    link_gctags::Vector{UInt32}
+    link_relocs::Vector{UInt32}
+    link_gvars::Vector{UInt32}
+    link_extfn::Vector{UInt32}
+    required::Vector{DepModEntry}
+end
+
+function _decode_offsetlist(P::Vector{UInt8}, start::Int)
+    positions = Int[]
+    last_pos = 0
+    off = start
+    while true
+        pos_diff = 0
+        cnt = 0
+        while true
+            b = P[off + 1]
+            off += 1
+            pos_diff |= Int(b & 0x7f) << (7 * cnt)
+            cnt += 1
+            (b & 0x80) == 0 && break
+        end
+        pos_diff == 0 && break
+        last_pos += pos_diff
+        push!(positions, last_pos)
+    end
+    return positions, off
+end
+
+# Parse the payload sections of a `.so`/`.ji` package image (staticdata.c:3338).
+function _parse_payload(path::String)
+    hdr = parse_header(path)
+    lay = _image_layout(path)
+    lay.has_data || throw(ArgumentError("no data blob in $path (a split .ji has its blob in the .so)"))
+    bytes = read(path)
+    ds = lay.data_start_file
+    de = lay.data_end_file
+    P = bytes[(ds + 1):de]
+    p = 0
+    sizeof_sysdata = Int(_read_u64le(P, p)); p += 8
+    blob_lo = 8
+    blob_hi = 8 + sizeof_sysdata
+    p = blob_hi
+    sizeof_const = Int(_read_u64le(P, p)); p += 8
+    p = _align(p, _JL_CACHE_BYTE_ALIGNMENT); const_lo = p; p += sizeof_const
+    const_hi = p
+    sizeof_syms = Int(_read_u64le(P, p)); p += 8
+    p = _align(p, 8); p += sizeof_syms
+    sizeof_relocs = Int(_read_u64le(P, p)); p += 8
+    p = _align(p, 8); relocs_start = p; p += sizeof_relocs
+    sizeof_gvar = Int(_read_u64le(P, p)); p += 8
+    p = _align(p, 8); gvar_start = p; p += sizeof_gvar
+    sizeof_fptr = Int(_read_u64le(P, p)); p += 8
+    p = _align(p, 8); p += sizeof_fptr
+    p = _align(p, 8)
+    droot_start = p
+    p += 6 * 8
+    n_gct = Int(_read_u32(P, p)); p += 4; link_gct = UInt32[_read_u32(P, p + 4k) for k in 0:(n_gct - 1)]; p += 4 * n_gct
+    n_rel = Int(_read_u32(P, p)); p += 4; link_rel = UInt32[_read_u32(P, p + 4k) for k in 0:(n_rel - 1)]; p += 4 * n_rel
+    n_gv = Int(_read_u32(P, p)); p += 4; link_gv = UInt32[_read_u32(P, p + 4k) for k in 0:(n_gv - 1)]; p += 4 * n_gv
+    n_ef = Int(_read_u32(P, p)); p += 4; link_ef = UInt32[_read_u32(P, p + 4k) for k in 0:(n_ef - 1)]; p += 4 * n_ef
+    external_fns_begin = Int(_read_u32(P, p)); p += 4
+    chain_end = p
+    chain_end == length(P) ||
+        throw(ArgumentError("payload section chain did not land at payload end " *
+                            "($chain_end vs $(length(P))) in $path — format mismatch?"))
+    gctags, o1 = _decode_offsetlist(P, relocs_start)
+    relocs, _ = _decode_offsetlist(P, o1)
+    ngvars = sizeof_gvar ÷ 8
+    return _PayloadImage(bytes, ds, P, blob_lo, blob_hi, const_lo, const_hi,
+                         gctags, relocs, gvar_start, ngvars, external_fns_begin,
+                         droot_start, link_gct, link_rel, link_gv, link_ef,
+                         hdr.required_modules)
+end
+
+@inline function _decode_reloc_word(v::UInt64)
+    tag = Int(v >> _RELOC_TAG_OFFSET)
+    if tag == _SYSIMAGE_LINKAGE
+        depsidx = Int((v >> _DEPS_IDX_OFFSET) &
+                      ((UInt64(1) << (_RELOC_TAG_OFFSET - _DEPS_IDX_OFFSET)) - 1))
+        offu = Int(v & ((UInt64(1) << _DEPS_IDX_OFFSET) - 1))
+        return tag, depsidx, offu * _SYS_EXTERNAL_LINK_UNIT
+    elseif tag == _EXTERNAL_LINKAGE
+        offu = Int(v & ((UInt64(1) << _RELOC_TAG_OFFSET) - 1))
+        return tag, -1, offu * _SYS_EXTERNAL_LINK_UNIT
+    else
+        return tag, -1, -1
+    end
+end
+
+# Every external reloc word in the image, across the external-capable sections
+# (gctags, relocs, gvars, external-fns, delayed roots). Returns
+# `(; pos, kind, depsidx, byte_offset, word)` where `pos` is the payload byte
+# position of the 8-byte word (the rewrite site).
+function _external_refs(img::_PayloadImage)
+    out = NamedTuple[]
+    for (poslist, links) in ((img.gctags, img.link_gctags), (img.relocs, img.link_relocs))
+        li = 1
+        for pos in poslist
+            v = _read_u64le(img.P, pos)
+            tag, dep, boff = _decode_reloc_word(v)
+            if tag == _SYSIMAGE_LINKAGE
+                push!(out, (; pos, kind = tag, depsidx = dep, byte_offset = boff, word = v))
+            elseif tag == _EXTERNAL_LINKAGE
+                dep2 = li <= length(links) ? Int(links[li]) : -1
+                li += 1
+                push!(out, (; pos, kind = tag, depsidx = dep2, byte_offset = boff, word = v))
+            end
+        end
+    end
+    li_gv = 1; li_ef = 1
+    for i in 0:(img.ngvars - 1)
+        pos = img.gvar_start + 8i
+        v = _read_u64le(img.P, pos)
+        tag, dep, boff = _decode_reloc_word(v)
+        if tag == _SYSIMAGE_LINKAGE
+            push!(out, (; pos, kind = tag, depsidx = dep, byte_offset = boff, word = v))
+        elseif tag == _EXTERNAL_LINKAGE
+            if i < img.external_fns_begin
+                dep2 = li_gv <= length(img.link_gvars) ? Int(img.link_gvars[li_gv]) : -1
+                li_gv += 1
+            else
+                dep2 = li_ef <= length(img.link_extfn) ? Int(img.link_extfn[li_ef]) : -1
+                li_ef += 1
+            end
+            push!(out, (; pos, kind = tag, depsidx = dep2, byte_offset = boff, word = v))
+        end
+    end
+    for k in 0:5
+        pos = img.droot_start + 8k
+        v = _read_u64le(img.P, pos)
+        tag, dep, boff = _decode_reloc_word(v)
+        tag == _SYSIMAGE_LINKAGE &&
+            push!(out, (; pos, kind = tag, depsidx = dep, byte_offset = boff, word = v))
+    end
+    return out
+end
+
+# ── Live-reflection helpers (leg5/sess_common.jl) ────────────────────
+#
+# `jl_linkage_blobs` is an arraylist of (lo, hi) pointer pairs, one per loaded
+# image, readable from stock Julia via cglobal. A dep's blob base is the `lo` of
+# the blob that contains the dep's root module pointer; an object at builder-side
+# `byte_offset` is `unsafe_pointer_to_objref(lo + byte_offset)`.
+
+function _blob_table()
+    p = cglobal(:jl_linkage_blobs, UInt)
+    len = unsafe_load(Ptr{UInt}(p), 1)
+    items = unsafe_load(Ptr{Ptr{UInt}}(p + 2 * sizeof(UInt)))
+    return [(unsafe_load(items, 2i + 1), unsafe_load(items, 2i + 2)) for i in 0:(len ÷ 2 - 1)]
+end
+
+function _blob_of(tbl, ptr::UInt)
+    for (i, (lo, hi)) in enumerate(tbl)
+        lo <= ptr < hi && return (i, lo, hi)   # 1-based index, base, end
+    end
+    return (0, UInt(0), UInt(0))
+end
+
+_vptr(x) = UInt(ccall(:jl_value_ptr, Ptr{Cvoid}, (Any,), x))
+
+# The linkage blob [lo, hi) that holds a dep's root module, or `nothing`.
+function _dep_blob(tbl, m::Module)
+    i, lo, hi = _blob_of(tbl, _vptr(m))
+    i == 0 && return nothing
+    return (lo, hi)
+end
+
+# ── Descriptor emission (builder side) ───────────────────────────────
+#
+# Describe a live object semantically. Priority: named entities (module,
+# binding, type, typename, function) first; then an anchor (named owner + a
+# deterministic field path found by a bounded walk); else `nothing` (caller
+# errors loudly — a builder-side failure is cheap, a consumer-side one is not).
+
+# The (modpath, name) of a module relative to a dep root: [] for the root itself,
+# else the chain of sub-module names. Returns `nothing` if `m` is not under `root`.
+function _module_path(root::Module, m::Module)
+    m === root && return Symbol[]
+    chain = Symbol[]
+    cur = m
+    while cur !== root
+        pm = parentmodule(cur)
+        pm === cur && return nothing        # reached a top module that isn't root
+        pushfirst!(chain, nameof(cur))
+        cur = pm
+    end
+    return chain
+end
+
+# Is `v` the object bound to `name` in `mod` (unwrapping UnionAll for types)?
+function _is_named_as(v, mod::Module, name::Symbol)
+    isdefined(mod, name) || return false
+    b = try
+        getglobal(mod, name)
+    catch
+        return false
+    end
+    return _vptr(b) == _vptr(v)
+end
+
+# Try to describe `obj` as a NAMED entity owned by module `owner_mod` (which is
+# under dep root `root`). Returns a RefDescriptor or `nothing`.
+function _describe_named(obj, root::Module, owner_mod::Module)
+    mp = _module_path(root, owner_mod)
+    mp === nothing && return nothing
+
+    if obj isa Module
+        omp = _module_path(root, obj)
+        omp === nothing && return nothing
+        return RefDescriptor(:module, omp, Symbol(""))
+    elseif obj isa Core.Binding
+        gr = obj.globalref
+        bmp = _module_path(root, gr.mod)
+        bmp === nothing && return nothing
+        return RefDescriptor(:binding, bmp, gr.name)
+    elseif obj isa Core.TypeName
+        # A typename is reached via its wrapper type's name binding.
+        w = obj.wrapper
+        base = Base.unwrap_unionall(w)
+        base isa DataType || return nothing
+        tnm = base.name.name
+        tmod = base.name.module
+        tmp = _module_path(root, tmod)
+        (tmp === nothing || !_is_named_as(w, tmod, tnm)) && return nothing
+        return RefDescriptor(:typename, tmp, tnm)
+    elseif obj isa DataType || obj isa UnionAll
+        base = Base.unwrap_unionall(obj)
+        base isa DataType || return nothing
+        tnm = base.name.name
+        tmod = base.name.module
+        tmp = _module_path(root, tmod)
+        tmp === nothing && return nothing
+        # Only when `obj` IS the module's named wrapper (not a parameterization).
+        _is_named_as(obj, tmod, tnm) || return nothing
+        return RefDescriptor(:type, tmp, tnm)
+    else
+        # Function / singleton instance.
+        T = typeof(obj)
+        if isdefined(T, :instance) && getfield(T, :instance) === obj
+            fmod = parentmodule(obj)
+            fnm = nameof(obj)
+            fmp = _module_path(root, fmod)
+            (fmp === nothing || !_is_named_as(obj, fmod, fnm)) && return nothing
+            return RefDescriptor(:function, fmp, fnm)
+        end
+    end
+    return nothing
+end
+
+# Which module (under `root`) most plausibly *owns* `obj`, for a first
+# named-description attempt.
+function _owning_module(obj, root::Module)
+    if obj isa Module
+        return obj
+    elseif obj isa Core.Binding
+        return obj.globalref.mod
+    elseif obj isa Core.TypeName
+        return obj.module
+    elseif obj isa DataType
+        return obj.name.module
+    elseif obj isa UnionAll
+        b = Base.unwrap_unionall(obj)
+        return b isa DataType ? b.name.module : root
+    else
+        return try
+            parentmodule(obj)
+        catch
+            root
+        end
+    end
+end
+
+# Deterministic child-navigation steps of an object, for anchor field paths.
+# Each step is (op, arg, child). Kept structural (never hash/iteration-ordered):
+# a rebuild lays these fields out differently but produces the SAME structure, so
+# the consumer replays the same path to the corresponding object.
+function _child_steps(obj)
+    steps = Tuple{Symbol, Any, Any}[]
+    if obj isa Core.SimpleVector
+        for i in 1:length(obj)
+            isassigned(obj, i) || continue
+            push!(steps, (:getindex, i, obj[i]))
+        end
+    elseif obj isa DataType
+        # Structurally-stable children (the parameters/types svecs, super, name).
+        for f in (:parameters, :types, :super, :name)
+            isdefined(obj, f) || continue
+            c = try
+                getfield(obj, f)
+            catch
+                continue
+            end
+            push!(steps, (:getfield, f, c))
+        end
+    elseif obj isa UnionAll
+        push!(steps, (:getfield, :var, obj.var))
+        push!(steps, (:getfield, :body, obj.body))
+    elseif obj isa Core.TypeofVararg
+        isdefined(obj, :T) && push!(steps, (:getfield, :T, obj.T))
+    elseif isstructtype(typeof(obj)) && !(obj isa Module)
+        T = typeof(obj)
+        for i in 1:fieldcount(T)
+            isdefined(obj, i) || continue
+            f = try
+                getfield(obj, i)
+            catch
+                continue
+            end
+            push!(steps, (:getfield, i, f))
+        end
+    end
+    return steps
+end
+
+# Bounded BFS from named roots in `owner_mod`'s dep to find `obj` by pointer
+# identity, returning an :anchor descriptor (owner + field path) or `nothing`.
+function _describe_anchor(obj, root::Module, tbl, blob_lo::UInt, blob_hi::UInt;
+                          max_nodes::Int = 20_000, max_depth::Int = 6)
+    target = _vptr(obj)
+    # Seed queue with named roots (bindings) of the whole dep module tree.
+    seeds = Tuple{Any, RefDescriptor}[]
+    for m in _dep_modules(root)
+        mp = _module_path(root, m)
+        mp === nothing && continue
+        for nm in names(m; all = true, imported = false)
+            isdefined(m, nm) || continue
+            v = try
+                getglobal(m, nm)
+            catch
+                continue
+            end
+            # Only in-blob objects can be the owner of an in-blob target.
+            (v isa Module || v isa Function || v isa Type) || continue
+            p = _vptr(v)
+            (blob_lo <= p < blob_hi) || continue
+            d = _describe_named(v, root, _owning_module(v, root))
+            d === nothing && continue
+            push!(seeds, (v, d))
+            p == target && return RefDescriptor(:anchor, Symbol[], Symbol(""), d, Tuple{Symbol, Any}[])
+        end
+    end
+    # BFS over structural children, tracking the path back to a seed.
+    visited = Set{UInt}()
+    Q = Tuple{Any, RefDescriptor, Vector{Tuple{Symbol, Any}}, Int}[]
+    for (v, d) in seeds
+        push!(Q, (v, d, Tuple{Symbol, Any}[], 0))
+        push!(visited, _vptr(v))
+    end
+    nnodes = 0
+    while !isempty(Q)
+        cur, owner, path, depth = popfirst!(Q)
+        nnodes += 1
+        (nnodes > max_nodes || depth >= max_depth) && continue
+        for (op, arg, child) in _child_steps(cur)
+            child === nothing && continue
+            cp = _vptr(child)
+            newpath = vcat(path, Tuple{Symbol, Any}[(op, arg)])
+            if cp == target
+                return RefDescriptor(:anchor, Symbol[], Symbol(""), owner, newpath)
+            end
+            (blob_lo <= cp < blob_hi) || continue   # stay inside this dep's blob
+            cp in visited && continue
+            push!(visited, cp)
+            push!(Q, (child, owner, newpath, depth + 1))
+        end
+    end
+    return nothing
+end
+
+# All modules in a dep's tree (root + submodules), for descriptor search.
+function _dep_modules(root::Module)
+    mods = Module[root]
+    stack = Module[root]
+    seen = Set{Module}([root])
+    while !isempty(stack)
+        m = pop!(stack)
+        for nm in names(m; all = true)
+            isdefined(m, nm) || continue
+            v = try
+                getglobal(m, nm)
+            catch
+                continue
+            end
+            if v isa Module && v ∉ seen && parentmodule(v) === m
+                push!(seen, v); push!(mods, v); push!(stack, v)
+            end
+        end
+    end
+    return mods
+end
+
+# Describe a live object: a named entity if possible, else an anchor, else
+# `nothing`. (No throw — the caller decides how to report an undescribable one.)
+function _describe_object(obj, root::Module, tbl, blob_lo::UInt, blob_hi::UInt)
+    d = _describe_named(obj, root, _owning_module(obj, root))
+    d !== nothing && return d
+    return _describe_anchor(obj, root, tbl, blob_lo, blob_hi)
+end
+
+# Describe the live object at (dep root `root`, blob `[lo,hi)`, `byte_offset`).
+# Errors loudly if it cannot be described — a builder-side failure is cheap,
+# a consumer-side one is not.
+function _describe_target(root::Module, tbl, blob_lo::UInt, blob_hi::UInt,
+                          byte_offset::Int, dep_name::AbstractString)
+    ptr = blob_lo + UInt(byte_offset)
+    (blob_lo <= ptr < blob_hi) ||
+        error("emit_sidecar: target offset $byte_offset out of $dep_name blob " *
+              "[$blob_lo, $blob_hi) — depsidx mapping wrong?")
+    obj = unsafe_pointer_to_objref(Ptr{Cvoid}(ptr))
+    d = _describe_object(obj, root, tbl, blob_lo, blob_hi)
+    d !== nothing && return d
+    error("emit_sidecar: cannot describe target in $dep_name at offset $byte_offset " *
+          "(kind $(typeof(obj))): no named entity and no anchor+field-path found. " *
+          "repr=" * _safe_repr(obj))
+end
+
+function _safe_repr(obj)
+    s = try
+        sprint(show, obj; context = :limit => true)
+    catch
+        string(typeof(obj))
+    end
+    return length(s) > 200 ? s[1:200] : s
+end
+
+# ── Descriptor resolution (consumer side) ────────────────────────────
+
+function _resolve_module(root::Module, modpath::Vector{Symbol})
+    m = root
+    for s in modpath
+        (isdefined(m, s) && getglobal(m, s) isa Module) ||
+            error("translate!: submodule $s not found under $(nameof(m))")
+        m = getglobal(m, s)::Module
+    end
+    return m
+end
+
+# Resolve a descriptor to the live consumer object it names.
+function _resolve_descriptor(d::RefDescriptor, root::Module)
+    if d.kind === :module
+        return _resolve_module(root, d.modpath)
+    elseif d.kind === :binding
+        m = _resolve_module(root, d.modpath)
+        b = ccall(:jl_get_module_binding, Any, (Any, Any, Cint), m, d.name, 1)
+        return b
+    elseif d.kind === :type
+        m = _resolve_module(root, d.modpath)
+        return getglobal(m, d.name)
+    elseif d.kind === :typename
+        m = _resolve_module(root, d.modpath)
+        T = getglobal(m, d.name)
+        return Base.unwrap_unionall(T).name
+    elseif d.kind === :function
+        m = _resolve_module(root, d.modpath)
+        return getglobal(m, d.name)
+    elseif d.kind === :anchor
+        cur = _resolve_descriptor(d.owner::RefDescriptor, root)
+        for (op, arg) in d.fieldpath
+            cur = _walk_step(cur, op, arg)
+        end
+        return cur
+    else
+        error("translate!: unknown descriptor kind $(d.kind)")
+    end
+end
+
+function _walk_step(cur, op::Symbol, arg)
+    if op === :getindex
+        return cur[arg]
+    elseif op === :getfield
+        return getfield(cur, arg)
+    else
+        error("translate!: unknown walk op $op")
+    end
+end
+
+# ── emit_sidecar (builder) ───────────────────────────────────────────
+
+"""
+    emit_sidecar(images::Vector{String}; depot=nothing, require::Bool=true) -> Sidecar
+
+Emit a reference-translation [`Sidecar`](@ref) for a set of private package
+`images` (`.so`/`.ji` paths), using **live reflection** on the builder's own
+loaded dependencies.
+
+For each private image, `emit_sidecar` parses every external reloc word
+(staticdata.c encoding), **skips** the ones that target the sysimage
+(`depsidx == 0`, stable across depots — measured 98.8%), and for each word into a
+separately-precompiled *pkgimage* dependency:
+
+1. loads the dep normally (`Base.require(PkgId)` — it is one of the builder's own
+   images) unless `require=false`,
+2. finds the dep's linkage blob via `jl_linkage_blobs` (`base + byte_offset` =
+   the live target object),
+3. emits a semantic [`RefDescriptor`](@ref) for that object — a named entity
+   (module / binding / type / typename / function) where possible, otherwise a
+   nearest-named-owner **anchor** with a deterministic field path.
+
+If a target can be described by neither a name nor an anchor, `emit_sidecar`
+errors loudly (a builder-side failure is cheap; a consumer-side one is not).
+
+# Arguments
+- `depot`: if given, prepended to `JULIA_DEPOT_PATH` is *not* done here — the
+  caller must already run in the builder's depot/project so the deps are
+  `Base.require`-able. `depot` is recorded for diagnostics only.
+- `require`: when `true` (default), `Base.require` each pkgimage dep before
+  resolving; set `false` if the caller has already loaded them.
+
+Returns a [`Sidecar`](@ref); persist it with [`write_sidecar`](@ref).
+
+!!! warning
+    Must run under the *same* Julia build the consumer will use — external
+    offsets and the reloc encoding are Julia-version specific.
+"""
+function emit_sidecar(images::Vector{String}; depot = nothing, require::Bool = true)
+    depot === nothing || @debug "emit_sidecar: builder depot" depot
+    image_sidecars = ImageSidecar[]
+    dep_root_cache = Dict{Tuple{String, UInt128}, Module}()
+
+    for path in images
+        img = _parse_payload(path)
+        hdr = parse_header(path)
+        refs = filter(r -> r.depsidx > 0, _external_refs(img))
+
+        # Group words by (depsidx, byte_offset): one distinct target each.
+        bytarget = Dict{Tuple{Int, Int}, Vector{Int}}()
+        wordval = Dict{Tuple{Int, Int}, UInt64}()
+        order = Tuple{Int, Int}[]
+        for r in refs
+            key = (r.depsidx, r.byte_offset)
+            if !haskey(bytarget, key)
+                bytarget[key] = Int[]
+                wordval[key] = r.word
+                push!(order, key)
+            end
+            push!(bytarget[key], r.pos)
+        end
+
+        # Require + resolve each referenced pkgimage dep once.
+        if require
+            for (depsidx, _) in order
+                dep = img.required[depsidx]
+                get!(dep_root_cache, (dep.name, UInt128(dep.build_id_hi) << 64 | dep.build_id_lo)) do
+                    Base.require(Base.PkgId(dep.uuid, dep.name))
+                end
+            end
+        end
+        # Fresh blob table AFTER this image's deps are required (later images may
+        # load more deps, appending blobs; a cached table would miss them).
+        tbl = _blob_table()
+
+        # Blob base per depsidx (against the fresh blob table).
+        blobinfo = Dict{Int, Tuple{Module, UInt, UInt}}()
+        targets = RefTarget[]
+        for key in order
+            depsidx, boff = key
+            dep = img.required[depsidx]
+            info = get!(blobinfo, depsidx) do
+                m = Base.root_module(Base.PkgId(dep.uuid, dep.name))
+                bl = _dep_blob(tbl, m)
+                bl === nothing && error("emit_sidecar: no linkage blob for dep $(dep.name) " *
+                                        "(depsidx $depsidx) — is it loaded?")
+                (m, bl[1], bl[2])
+            end
+            m, lo, hi = info
+            d = _describe_target(m, tbl, lo, hi, boff, dep.name)
+            push!(targets, RefTarget(depsidx, dep.name,
+                                     UInt128(dep.uuid.value), boff, d,
+                                     wordval[key], sort!(bytarget[key])))
+        end
+
+        w = isempty(hdr.worklist) ? _effective_worklist(hdr, path) : hdr.worklist
+        iname = isempty(w) ? splitext(basename(path))[1] : w[end].name
+        iuuid = isempty(w) ? UInt128(0) : UInt128(w[end].uuid.value)
+        push!(image_sidecars, ImageSidecar(iname, iuuid, string(VERSION),
+                                           length(refs), targets))
+    end
+    return Sidecar(1, image_sidecars)
+end
+
+# ── translate! (consumer) ────────────────────────────────────────────
+
+"""
+    translate!(image_path::String, sidecar; depot=nothing, require::Bool=true,
+               restamp::Bool=true) -> TranslationReport
+
+Rewrite a **copy** of a private package image so its cross-image references point
+into the *consumer's own* rebuild of the dependencies, using the semantic
+[`RefDescriptor`](@ref)s in `sidecar` (a [`Sidecar`](@ref) or a path to one).
+
+For the matching image in the sidecar, `translate!`:
+
+1. resolves each descriptor to a live object in the consumer's loaded deps
+   (`Base.require` them first unless `require=false`),
+2. computes the object's offset in its owning linkage blob
+   (`jl_value_ptr - blob_base`, the `jl_linkage_blobs` technique in reverse),
+3. rewrites every ref word for that target in place
+   (`(5<<61) | (depsidx<<40) | (new_offset÷8)`),
+4. restamps the image's checksums (embedded `.so` checksum + mirrored `.ji`
+   header checksum + `.ji` trailer CRCs — reusing the [`stamp_identity!`](@ref)
+   restamp path) unless `restamp=false`.
+
+`image_path` **must** be a writable copy; the file is modified in place. Each
+word's decoded `(depsidx, offset)` and raw value are checked against the sidecar
+before rewriting (integrity), so a mismatched image fails loudly.
+
+Header dependency-identity remapping is *not* done here — do it at load time with
+[`remap!`](@ref) / [`load_package_image`](@ref) against the actually-loaded
+consumer modules, or use [`load_translated`](@ref) which chains everything.
+
+Returns a [`TranslationReport`](@ref).
+"""
+function translate!(image_path::String, sidecar; depot = nothing,
+                    require::Bool = true, restamp::Bool = true)
+    sc = sidecar isa Sidecar ? sidecar : read_sidecar(String(sidecar))
+    depot === nothing || @debug "translate!: consumer depot" depot
+
+    img = _parse_payload(image_path)
+    # Match this image to its sidecar entry by worklist name.
+    hdr = parse_header(image_path)
+    w = isempty(hdr.worklist) ? _effective_worklist(hdr, image_path) : hdr.worklist
+    iname = isempty(w) ? splitext(basename(image_path))[1] : w[end].name
+    isc = findfirst(s -> s.image_name == iname, sc.images)
+    isc === nothing && error("translate!: no sidecar entry for image '$iname'")
+    entry = sc.images[isc]
+    entry.julia_version == string(VERSION) ||
+        @warn "translate!: sidecar emitted under Julia $(entry.julia_version), running $(VERSION)"
+
+    if require
+        for t in entry.targets
+            try
+                Base.require(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
+            catch e
+                @warn "translate!: could not require dep $(t.dep_name)" exception = e
+            end
+        end
+    end
+    tbl = _blob_table()
+    blobbase = Dict{Int, UInt}()
+
+    so = copy(img.bytes)            # edit the raw file bytes (payload_base offset)
+    words_rewritten = 0
+    words_unchanged = 0
+    words_checked = 0
+    resolved = 0
+    failed = String[]
+
+    for t in entry.targets
+        # Resolve the target's dep blob base on the consumer side.
+        base = get!(blobbase, t.depsidx) do
+            m = Base.root_module(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
+            bl = _dep_blob(tbl, m)
+            bl === nothing ? UInt(0) : bl[1]
+        end
+        if base == 0
+            push!(failed, "$(t.dep_name)@$(t.old_offset): dep not loaded")
+            continue
+        end
+        root = Base.root_module(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
+        obj = try
+            _resolve_descriptor(t.descriptor, root)
+        catch e
+            push!(failed, "$(t.dep_name)@$(t.old_offset): $(sprint(showerror, e))")
+            continue
+        end
+        newoff = Int(_vptr(obj) - base)
+        newoff >= 0 && newoff % 8 == 0 ||
+            (push!(failed, "$(t.dep_name)@$(t.old_offset): bad new offset $newoff"); continue)
+        resolved += 1
+        newword = (UInt64(_SYSIMAGE_LINKAGE) << _RELOC_TAG_OFFSET) |
+                  (UInt64(t.depsidx) << _DEPS_IDX_OFFSET) | UInt64(newoff ÷ 8)
+        for pos in t.positions
+            fpos = img.payload_base + pos
+            words_checked += 1
+            v = _read_u64le(so, fpos)
+            v == t.expected_word ||
+                error("translate!: integrity check failed at payload pos $pos " *
+                      "(word 0x$(string(v, base=16)) != expected 0x$(string(t.expected_word, base=16)))")
+            if newword == v
+                words_unchanged += 1
+            else
+                _write_u64le!(so, fpos, newword)
+                words_rewritten += 1
+            end
+        end
+    end
+
+    write(image_path, so)
+    _is_shared_library(image_path) && chmod(image_path, 0o755)
+
+    old_ck = UInt64(0); new_ck = UInt64(0)
+    if restamp
+        old_ck = _image_layout(image_path).checksum
+        new_ck = _restamp_checksums!(image_path)
+    end
+
+    ok = isempty(failed) && (!restamp || new_ck != 0)
+    return TranslationReport(image_path, words_checked, words_rewritten,
+                             words_unchanged, resolved, failed, old_ck, new_ck, ok)
+end
+
+# Recompute an image's embedded checksum over its data blob, mirror it into the
+# companion `.ji` header, and rewrite the `.ji` trailer CRCs — reusing the
+# `stamp_identity!` restamp internals. Returns the new 64-bit checksum.
+function _restamp_checksums!(image_path::String)
+    ji, so = _split_pair(image_path)
+    if ji === nothing && so === nothing
+        _is_shared_library(image_path) ? (so = image_path) : (ji = image_path)
+    end
+    datafile = so !== nothing ? so : ji
+    lay = _image_layout(datafile)
+    bytes = read(datafile)
+    crc = crc32c(@view bytes[(lay.data_start_file + 1):lay.data_end_file])
+    newck = (UInt64(0xfafbfcfd) << 32) | UInt64(crc)
+    _write_checksum!(datafile, lay.checksum_off, newck)
+    if so !== nothing && ji !== nothing
+        _write_checksum!(ji, _image_layout(ji).checksum_off, newck)
+    end
+    ji === nothing || _rewrite_ji_trailer!(ji, so)
+    return newck
+end
+
+# ── Sidecar persistence ──────────────────────────────────────────────
+
+"""
+    write_sidecar(path::String, sc::Sidecar)
+
+Serialize a [`Sidecar`](@ref) to `path` (Julia `Serialization`; only valid for
+the same Julia build, which is exactly the translation constraint anyway).
+"""
+function write_sidecar(path::String, sc::Sidecar)
+    open(path, "w") do io
+        Serialization.serialize(io, sc)
+    end
+    return path
+end
+
+"""
+    read_sidecar(path::String) -> Sidecar
+
+Deserialize a [`Sidecar`](@ref) written by [`write_sidecar`](@ref).
+"""
+function read_sidecar(path::String)
+    sc = open(Serialization.deserialize, path)
+    sc isa Sidecar || throw(ArgumentError("$path is not a JSD Sidecar"))
+    return sc
+end
+
+# ── canonicalize! (post-load type-hash repair) ───────────────────────
+#
+# leg5 wall #5: TypeName hashes are salted with the owning module's per-build
+# `build_id.lo` nonce (datatype.c:84), so a translated image's own method
+# signatures carry stale baked type hashes; `typeintersect` / type-cache probes /
+# `objectid` then silently miss even though the refs point at the right objects.
+# Repair = re-intern each private method sig through live consumer constructors
+# (POINTER compare, `===` lies for types here) and re-insert ONLY the dispatch
+# entries that are genuinely broken (unconditional re-insert causes ambiguities).
+
+function _canonsig(t)
+    if t isa UnionAll
+        b = _canonsig(t.body)
+        return b === t.body ? t : UnionAll(t.var, b)
+    elseif t isa Core.TypeofVararg
+        isdefined(t, :T) || return t
+        T2 = _canonsig(t.T)
+        return isdefined(t, :N) ? Vararg{T2, t.N} : Vararg{T2}
+    elseif t isa DataType
+        isempty(t.parameters) && return t
+        ps = Any[p isa Type || p isa Core.TypeofVararg ? _canonsig(p) : p for p in t.parameters]
+        if t.name.name === :Tuple
+            # Tuple types are NOT interned, so `Tuple{ps...}` yields a fresh
+            # object every call — rebuilding unconditionally makes the pass
+            # non-idempotent (and re-allocates every method sig on each run). Only
+            # rebuild when a parameter's identity actually changed (a salted
+            # component was canonicalized); otherwise keep the original, so a
+            # method sig with no salted components is a fixpoint.
+            changed = any(i -> _vptr(ps[i]) != _vptr(t.parameters[i]), eachindex(ps))
+            return changed ? Tuple{ps...} : t
+        end
+        # Interned (cached) types: re-instantiate through the wrapper so a
+        # builder-salted duplicate is replaced by the consumer-canonical object
+        # (returns the same pointer when already canonical → idempotent).
+        return try
+            t.name.wrapper{ps...}
+        catch
+            t
+        end
+    else
+        return t
+    end
+end
+
+"""
+    canonicalize!(mods::Module...) -> CanonicalizeReport
+
+Post-load type-hash repair for freshly [`translate!`](@ref)d private modules
+(leg5 wall #5). Idempotent.
+
+`TypeName` hashes are salted with the owning module's per-build `build_id.lo`
+nonce (`datatype.c:84` @ v1.12.6), so a translated image's own method signatures
+carry stale baked type hashes valid only in the *builder's* nonce universe;
+hash-consulting dispatch paths (type-cache probes, `typeintersect`, `objectid`)
+then silently miss and dispatch fails with a paradoxical `MethodError` even
+though the listed candidate matches.
+
+This pass walks every method defined by `mods` (and their submodules),
+reconstructs each `Method.sig` through the live consumer-side type constructors —
+which intern against the consumer's canonical type caches — compares by pointer
+(`===` is structural and *lies* here), patches the field, and re-inserts only the
+dispatch entries the method table can no longer find for their own canonical
+signature.
+
+Returns a [`CanonicalizeReport`](@ref).
+"""
+function canonicalize!(mods::Module...)
+    allmods = Set{Module}()
+    for r in mods
+        union!(allmods, _dep_modules(r))
+    end
+    sigidx = findfirst(==(:sig), fieldnames(Method))
+    nseen = 0; nfix = 0; nreins = 0
+    visited = Set{UInt}()
+    for m in allmods, n in names(m; all = true, imported = true)
+        isdefined(m, n) || continue
+        v = try
+            getglobal(m, n)
+        catch
+            continue
+        end
+        (v isa Function || v isa Type) || continue
+        ml = try
+            methods(v)
+        catch
+            continue
+        end
+        for meth in ml
+            meth.module in allmods || continue
+            objectid(meth) in visited && continue
+            push!(visited, objectid(meth)); nseen += 1
+            cs = try
+                _canonsig(meth.sig)
+            catch
+                meth.sig
+            end
+            _vptr(cs) == _vptr(meth.sig) && continue     # already canonical (idempotent)
+            cs == meth.sig || continue                   # structure must be identical
+            try
+                ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), meth, sigidx - 1, cs)
+                nfix += 1
+                broken = true
+                try
+                    for mm in Base._methods_by_ftype(cs, -1, Base.get_world_counter())
+                        if mm.method === meth
+                            broken = false; break
+                        end
+                    end
+                catch
+                end
+                if broken
+                    mt = ccall(:jl_method_table_for, Any, (Any,), cs)
+                    if mt !== nothing
+                        ccall(:jl_method_table_insert, Cvoid, (Any, Any, Ptr{Cvoid}), mt, meth, C_NULL)
+                        nreins += 1
+                    end
+                end
+            catch e
+                @debug "canonicalize!: sig-fix failed" file = meth.file line = meth.line exception = e
+            end
+        end
+    end
+    return CanonicalizeReport(nseen, nfix, nreins, String[string(nameof(m)) for m in mods])
+end
+
+# Remap an image's header dependency identities to the build-ids of the
+# currently-loaded consumer modules of the same (uuid, name) — leg5's
+# consumer-side header algorithm. A translated private image adopts new
+# checksums, and its downstream headers must carry the loaded deps' identities
+# (private-to-private entries INCLUDED — do not skip them). Returns the specs
+# that were applied.
+function _remap_to_loaded!(image_path::String)
+    hdr = parse_header(image_path)
+    specs = RemapSpec[]
+    for dep in hdr.required_modules
+        _is_sysimage_dep(dep) && continue
+        pid = Base.PkgId(dep.uuid, dep.name)
+        m = get(Base.loaded_modules, pid, nothing)
+        m === nothing && continue
+        bid = Base.module_build_id(m)
+        cur = (UInt128(dep.build_id_hi) << 64) | UInt128(dep.build_id_lo)
+        bid == cur && continue
+        push!(specs, RemapSpec(dep.name, dep.uuid, bid))
+    end
+    if !isempty(specs)
+        ji, so = _split_pair(image_path)
+        (ji === nothing && so === nothing) &&
+            (_is_shared_library(image_path) ? (so = image_path) : (ji = image_path))
+        ji === nothing || remap!(ji, specs)
+        so === nothing || remap!(so, specs)
+    end
+    return specs
+end
+
+# ── load_translated (top-level convenience) ──────────────────────────
+
+"""
+    load_translated(image_path::String, sidecar; depot=nothing,
+                    check_closure::Bool=true, canonicalize::Bool=true,
+                    remap::Bool=true, translated::Bool=false)
+        -> (mod, translate_report, canon_report)
+
+End-to-end consumer path for a translated private image, chaining
+[`translate!`](@ref) → header remap-to-loaded → [`verify_closure`](@ref) →
+[`load_package_image`](@ref) → [`canonicalize!`](@ref).
+
+Steps:
+1. **translate** (unless `translated=true`): [`translate!`](@ref) rewrites the
+   cross-image ref words and restamps the checksums. The file is modified in
+   place — pass a writable *copy*. `translate!` also `Base.require`s the
+   consumer's rebuilt deps, so they are loaded for the next step.
+2. **remap** (when `remap=true`): rewrite the image's header dependency
+   identities to the build-ids of the now-loaded consumer deps, so
+   `resolve_dep` finds them (leg5's consumer-side header algorithm; private↔
+   private entries included).
+3. **load**: [`load_package_image`](@ref) with `check_closure` (turns a
+   mixed-lineage segfault into a clean error).
+4. **canonicalize** (when `canonicalize=true`): the post-load type-hash repair.
+
+Returns `(mod, translate_report, canon_report)`; the report fields are `nothing`
+when the corresponding step is skipped.
+"""
+function load_translated(image_path::String, sidecar; depot = nothing,
+                         check_closure::Bool = true, canonicalize::Bool = true,
+                         remap::Bool = true, translated::Bool = false)
+    trep = translated ? nothing : translate!(image_path, sidecar; depot = depot)
+    trep === nothing || trep.ok ||
+        @warn "load_translated: translate! reported failures" trep.targets_failed
+    remap && _remap_to_loaded!(image_path)
+    mod = load_package_image(image_path; check_closure = check_closure)
+    crep = canonicalize ? canonicalize!(mod) : nothing
+    return (mod, trep, crep)
+end
