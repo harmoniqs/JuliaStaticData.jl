@@ -523,6 +523,10 @@ function _describe_target(root::Module, tbl, blob_lo::UInt, blob_hi::UInt,
             return _describe_svec_content(obj, dep_ctx, byte_offset, dep_name)
         elseif obj isa String
             return _describe_const_data(obj, dep_ctx, byte_offset, dep_name)
+        elseif obj isa Method
+            return _describe_method(obj, dep_ctx, byte_offset, dep_name, root)
+        elseif obj isa Type
+            return _describe_type_content(obj, dep_ctx, byte_offset, dep_name)
         end
     end
     error("emit_sidecar: cannot describe target in $dep_name at offset $byte_offset " *
@@ -731,6 +735,83 @@ function _describe_const_data(obj, ctx::_DepCtx, boff::Int, dep_name::AbstractSt
                          Tuple{Symbol, Any}[], payload, r, length(offs))
 end
 
+# Structural (interning-independent) type equality via mutual subtyping.
+function _type_eq(a, b)
+    (a isa Type && b isa Type) || return false
+    return try
+        a <: b && b <: a
+    catch
+        false
+    end
+end
+
+# Offsets of every in-blob TYPE object structurally equal to `T` (a Union / an
+# anonymous UnionAll / an un-named DataType parameterization — content-describable
+# by its own structure, but with no name and no build-stable anchor path).
+function _match_type_offsets(ctx::_DepCtx, T)
+    offs = Int[]
+    for gp in ctx.img.gctags
+        boff = gp + 8
+        ptr = ctx.lo + UInt(boff)
+        (ctx.lo <= ptr < ctx.hi) || continue
+        obj = try
+            unsafe_pointer_to_objref(Ptr{Cvoid}(ptr))
+        catch
+            continue
+        end
+        (obj isa Type && _type_eq(obj, T)) && push!(offs, boff)
+    end
+    return sort!(offs)
+end
+
+function _describe_type_content(obj, ctx::_DepCtx, boff::Int, dep_name::AbstractString)
+    payload = _pack(obj)
+    T2 = _unpack(payload)
+    offs = _match_type_offsets(ctx, T2)
+    r = findfirst(==(boff), offs)
+    r === nothing &&
+        error("emit_sidecar: $dep_name type@$boff — content self-check failed " *
+              "(round-tripped type did not re-locate; matches=$offs). type=" * _safe_repr(obj))
+    return RefDescriptor(:type_content, Symbol[], Symbol(""), nothing,
+                         Tuple{Symbol, Any}[], payload, r, length(offs))
+end
+
+# Resolve a method by (defining-module path, name, structural signature): among the
+# world's methods whose ftype-signature admits `sig`, the one defined in `ownermod`
+# as `name` with a structurally-identical `sig`. Returns its blob byte offset.
+function _resolve_method_offset(sig, root::Module, mp::Vector{Symbol}, name::Symbol, ctx::_DepCtx)
+    ownermod = _resolve_module(root, mp)
+    cands = Base._methods_by_ftype(sig, -1, Base.get_world_counter())
+    cands === false && error("method: _methods_by_ftype failed for $(_safe_repr(sig))")
+    hits = Method[]
+    for mm in cands
+        meth = mm.method
+        (meth.name === name && meth.module === ownermod) || continue
+        (meth.sig <: sig && sig <: meth.sig) || continue
+        push!(hits, meth)
+    end
+    isempty(hits) && error("method: no live method matches $(name) in $(nameof(ownermod)) with sig $(_safe_repr(sig))")
+    length(hits) > 1 && error("method: ambiguous ($(length(hits)) live methods match) for $(name)")
+    off = Int(_vptr(hits[1]) - ctx.lo)
+    (0 <= off < Int(ctx.hi - ctx.lo)) ||
+        error("method: resolved method offset $off out of blob for $(name)")
+    return off
+end
+
+function _describe_method(m::Method, ctx::_DepCtx, boff::Int, dep_name::AbstractString,
+                          root::Module)
+    mp = _module_path(root, m.module)
+    mp === nothing &&
+        error("emit_sidecar: $dep_name method@$boff — defining module $(m.module) " *
+              "not under dep root $(nameof(root))")
+    payload = _pack(m.sig)
+    off = _resolve_method_offset(_unpack(payload), root, mp, m.name, ctx)
+    off == boff ||
+        error("emit_sidecar: $dep_name method@$boff — self-check found offset $off " *
+              "(method $(m.name), sig $(_safe_repr(m.sig)))")
+    return RefDescriptor(:method, mp, m.name, nothing, Tuple{Symbol, Any}[], payload, 0, 0)
+end
+
 # ── Descriptor resolution (consumer side) ────────────────────────────
 
 function _resolve_module(root::Module, modpath::Vector{Symbol})
@@ -767,7 +848,8 @@ function _resolve_descriptor(d::RefDescriptor, root::Module)
             cur = _walk_step(cur, op, arg)
         end
         return cur
-    elseif d.kind === :svec_content || d.kind === :const_data
+    elseif d.kind === :svec_content || d.kind === :const_data ||
+           d.kind === :type_content || d.kind === :method
         error("translate!: $(d.kind) is a content descriptor — resolve it against a " *
               "dep blob with `_resolve_new_offset`, not `_resolve_descriptor` " *
               "(it has no live object to return, only a matched offset)")
@@ -791,7 +873,7 @@ end
 # resolve to a live object whose offset is `jl_value_ptr - blob_base`; content kinds
 # must instead SEARCH the consumer blob, since the object has no name and no stable
 # path — see `_match_svec_offsets` / `_match_const_string_offsets`.)
-function _resolve_new_offset(t::RefTarget, ctx::_DepCtx)
+function _resolve_new_offset(t::RefTarget, root::Module, ctx::_DepCtx)
     d = t.descriptor
     tag = "$(t.dep_name)@$(t.old_offset)"
     if d.kind === :svec_content
@@ -802,6 +884,12 @@ function _resolve_new_offset(t::RefTarget, ctx::_DepCtx)
         s = _unpack(d.payload)
         offs = _match_const_string_offsets(ctx, s)
         return _pick_ranked(offs, d.rank, d.cohort, "const_data $tag")
+    elseif d.kind === :type_content
+        T = _unpack(d.payload)
+        offs = _match_type_offsets(ctx, T)
+        return _pick_ranked(offs, d.rank, d.cohort, "type_content $tag")
+    elseif d.kind === :method
+        return _resolve_method_offset(_unpack(d.payload), root, d.modpath, d.name, ctx)
     else
         error("translate!: _resolve_new_offset called on non-content descriptor $(d.kind)")
     end
@@ -1007,6 +1095,9 @@ function translate!(image_path::String, sidecar; depot = nothing,
         catch
             nothing
         end
+        # Fall back to loaded_precompiles for an upstream private loaded via
+        # `load_package_image` (not registered in loaded_modules / root_module).
+        m === nothing && (m = _loaded_module_by_pid(pid))
         m === nothing && return (m = nothing, lo = UInt(0), ctx = nothing)
         bl = _dep_blob(tbl, m)
         bl === nothing && return (m = m, lo = UInt(0), ctx = nothing)
@@ -1035,7 +1126,10 @@ function translate!(image_path::String, sidecar; depot = nothing,
             push!(failed, "$(t.dep_name)@$(t.old_offset): dep not loaded")
             continue
         end
-        is_content = t.descriptor.kind === :svec_content || t.descriptor.kind === :const_data
+        is_content = t.descriptor.kind === :svec_content ||
+                     t.descriptor.kind === :const_data ||
+                     t.descriptor.kind === :type_content ||
+                     t.descriptor.kind === :method
         if is_content && info.ctx === nothing
             push!(failed, "$(t.dep_name)@$(t.old_offset): content descriptor but " *
                           "dep package image not found for blob enumeration")
@@ -1043,7 +1137,7 @@ function translate!(image_path::String, sidecar; depot = nothing,
         end
         newoff = try
             if is_content
-                _resolve_new_offset(t, info.ctx::_DepCtx)
+                _resolve_new_offset(t, info.m::Module, info.ctx::_DepCtx)
             else
                 obj = _resolve_descriptor(t.descriptor, info.m::Module)
                 Int(_vptr(obj) - info.lo)
@@ -1200,6 +1294,45 @@ signature.
 
 Returns a [`CanonicalizeReport`](@ref).
 """
+# Whether dispatch can find `meth` when queried with signature `probe`. A
+# nonce-salted (stale-hash) method is the pathology leg5 wall #5 describes: `===` /
+# subtyping still hold (structural), but the hash-consulting cache probe inside
+# `_methods_by_ftype` MISSES. Crucially the query must use a **freshly-reconstructed**
+# (consumer-hash) signature: probing with the method's OWN stale-hashed sig would
+# still match the stale-stored table entry and falsely report health. Probing with a
+# fresh-hash sig reveals the mismatch — and makes the repair idempotent (a re-inserted
+# method is stored under the fresh hash, so the next pass's fresh-hash probe finds it).
+function _sig_findable(meth::Method, probe)
+    return try
+        found = false
+        for mm in Base._methods_by_ftype(probe, -1, Base.get_world_counter())
+            if mm.method === meth
+                found = true
+                break
+            end
+        end
+        found
+    catch
+        true   # cannot probe (odd sig) → treat as healthy, leave it alone
+    end
+end
+
+# Reconstruct a signature so its (and its components') type hashes are recomputed in
+# the CONSUMER's nonce universe. Interned parametric components go through
+# `_canonsig` (idempotent — returns the same pointer once canonical); the sig's own
+# `Tuple` wrapper is rebuilt UNCONDITIONALLY, because Tuple types are not interned so
+# the only way to refresh a stale baked hash is to construct a fresh one.
+function _recanon_sig(t)
+    if t isa UnionAll
+        return UnionAll(t.var, _recanon_sig(t.body))
+    elseif t isa DataType && t.name.name === :Tuple
+        ps = Any[(p isa Type || p isa Core.TypeofVararg) ? _canonsig(p) : p for p in t.parameters]
+        return Tuple{ps...}
+    else
+        return _canonsig(t)
+    end
+end
+
 function canonicalize!(mods::Module...)
     allmods = Set{Module}()
     for r in mods
@@ -1225,31 +1358,34 @@ function canonicalize!(mods::Module...)
             meth.module in allmods || continue
             objectid(meth) in visited && continue
             push!(visited, objectid(meth)); nseen += 1
+            # Reconstruct the sig with consumer-universe hashes, then gate strictly on
+            # brokenness (idempotent: a healthy/repaired method is found by the
+            # fresh-hash probe and skipped). Unconditional re-interning of every sig
+            # is slow and — for re-insertion — dangerous (duplicate dispatch entries →
+            # spurious ambiguities).
             cs = try
-                _canonsig(meth.sig)
+                _recanon_sig(meth.sig)
             catch
-                meth.sig
+                continue
             end
-            _vptr(cs) == _vptr(meth.sig) && continue     # already canonical (idempotent)
-            cs == meth.sig || continue                   # structure must be identical
+            _sig_findable(meth, cs) && continue          # dispatch already finds it → healthy
+            same = try                                   # alpha-equivalent same signature
+                cs <: meth.sig && meth.sig <: cs
+            catch
+                false
+            end
+            same || continue
             try
-                ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), meth, sigidx - 1, cs)
-                nfix += 1
-                broken = true
-                try
-                    for mm in Base._methods_by_ftype(cs, -1, Base.get_world_counter())
-                        if mm.method === meth
-                            broken = false; break
-                        end
-                    end
-                catch
+                if _vptr(cs) != _vptr(meth.sig)
+                    ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), meth, sigidx - 1, cs)
+                    nfix += 1
                 end
-                if broken
-                    mt = ccall(:jl_method_table_for, Any, (Any,), cs)
-                    if mt !== nothing
-                        ccall(:jl_method_table_insert, Cvoid, (Any, Any, Ptr{Cvoid}), mt, meth, C_NULL)
-                        nreins += 1
-                    end
+                # Broken ⇒ the stored dispatch entry is under a stale hash; re-insert
+                # so the method is reachable under its consumer-hash signature.
+                mt = ccall(:jl_method_table_for, Any, (Any,), cs)
+                if mt !== nothing
+                    ccall(:jl_method_table_insert, Cvoid, (Any, Any, Ptr{Cvoid}), mt, meth, C_NULL)
+                    nreins += 1
                 end
             catch e
                 @debug "canonicalize!: sig-fix failed" file = meth.file line = meth.line exception = e
@@ -1271,7 +1407,11 @@ function _remap_to_loaded!(image_path::String)
     for dep in hdr.required_modules
         _is_sysimage_dep(dep) && continue
         pid = Base.PkgId(dep.uuid, dep.name)
-        m = get(Base.loaded_modules, pid, nothing)
+        # Consult loaded_precompiles too: an upstream private already loaded via
+        # `load_package_image` (e.g. a translated Altissimo) lands there, not in
+        # loaded_modules — and a downstream private's header MUST be remapped to
+        # its NEW (restamped) build-id or the closure check flags mixed lineage.
+        m = _loaded_module_by_pid(pid)
         m === nothing && continue
         bid = Base.module_build_id(m)
         cur = (UInt128(dep.build_id_hi) << 64) | UInt128(dep.build_id_lo)

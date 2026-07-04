@@ -59,6 +59,26 @@ function _find_loaded_module(name::AbstractString, build_id::UInt128)
     return nothing
 end
 
+# The loaded module for a `PkgId`, searching `loaded_precompiles` (where
+# `load_package_image` registers restored modules) as well as `loaded_modules` and
+# the well-known roots. A private image loaded via `load_package_image` lands in
+# `loaded_precompiles` but NOT `loaded_modules`, so a plain `root_module`/
+# `loaded_modules` lookup misses it — this finds it (used when translating a
+# downstream private that depends on an already-loaded private, and when remapping
+# headers to the loaded universe).
+function _loaded_module_by_pid(pid::Base.PkgId)
+    m = get(Base.loaded_modules, pid, nothing)
+    m === nothing || return m
+    for (p, mods) in Base.loaded_precompiles
+        (p.uuid === pid.uuid && p.name == pid.name) || continue
+        isempty(mods) || return last(mods)
+    end
+    for mod in (Core, Base, Main)
+        (pid.name == String(nameof(mod))) && return mod
+    end
+    return nothing
+end
+
 # All 128-bit build-ids under which a module `name` is currently loaded (across
 # `loaded_precompiles` and `loaded_modules`). Used to distinguish a genuinely
 # `:absent` dependency from a `:mixed_lineage` one (name present, wrong build-id).

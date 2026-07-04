@@ -653,7 +653,7 @@ end
                 d.kind === :svec_content || continue
                 n_svec[] += 1
                 t = J.RefTarget(1, "Dep", UInt128(0), boff, d, UInt64(0), Int[])
-                newoff = try J._resolve_new_offset(t, ctx) catch; -1 end
+                newoff = try J._resolve_new_offset(t, Dep, ctx) catch; -1 end
                 newoff == boff && (n_svec_ok[] += 1)
             end
             println("SVEC content targets=", n_svec[], " roundtrip_ok=", n_svec_ok[])
@@ -663,7 +663,7 @@ end
             sboff = Int(vp(s) - lo)
             dc = J._describe_target(Dep, tbl, lo, hi, sboff, "Dep"; dep_ctx = ctx)
             tc = J.RefTarget(1, "Dep", UInt128(0), sboff, dc, UInt64(0), Int[])
-            cnew = J._resolve_new_offset(tc, ctx)
+            cnew = J._resolve_new_offset(tc, Dep, ctx)
             println("CONST kind=", dc.kind, " roundtrip_ok=", cnew == sboff,
                     " inconst=", ctx.img.const_lo <= sboff < ctx.img.const_hi)
             println("CONTENT PROBE DONE")
