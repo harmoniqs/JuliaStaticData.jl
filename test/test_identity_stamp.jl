@@ -227,6 +227,30 @@ end
                           xs -> only(filter(x -> endswith(x, ".so"), xs))))
                 @test dry_verify(dep_so).ok
 
+                # ── .ji trailer CRCs ──
+                # A self_crc stamp must rewrite the two trailer CRCs at the .ji's
+                # tail (whole-.so CRC + .ji-self CRC) so the pair STILL passes
+                # Base's stale_cachefile/isprecompiled validation path
+                # (isvalid_file_crc + isvalid_pkgimage_crc, base/loading.jl @ 1.12.6).
+                # Otherwise a depot-resident stamped image would be seen as stale by
+                # an ordinary `using`/`import`. Guarded on the Base internals since
+                # they are not part of the public API.
+                if isdefined(Base, :isvalid_file_crc) && isdefined(Base, :isvalid_pkgimage_crc)
+                    tdir = mktempdir()
+                    for f in readdir(joinpath(stash, "dep"); join=true)
+                        cp(f, joinpath(tdir, basename(f)); force=true)
+                    end
+                    tso = only(filter(x -> endswith(x, ".so"), readdir(tdir; join=true)))
+                    tji = only(filter(x -> endswith(x, ".ji"), readdir(tdir; join=true)))
+                    # Sanity: the freshly-built pair already validates.
+                    @test open(Base.isvalid_file_crc, tji)
+                    @test open(io -> Base.isvalid_pkgimage_crc(io, tso), tji)
+                    # After a consistent stamp, Base's validators STILL accept it.
+                    stamp_identity!(tso; build_id_lo=UInt64(0x0123456789ABCDEF))
+                    @test open(Base.isvalid_file_crc, tji)
+                    @test open(io -> Base.isvalid_pkgimage_crc(io, tso), tji)
+                end
+
                 perturb = mktempdir()
                 for f in readdir(joinpath(stash, "dep"); join=true)
                     cp(f, joinpath(perturb, basename(f)); force=true)
@@ -236,6 +260,12 @@ end
                 vstale = dry_verify(pso)
                 @test vstale.crc_ok == false
                 @test vstale.ok == false
+                # Negative control: self_crc=false leaves the .ji trailer stale too,
+                # so Base's own validator rejects the pair (teeth for the block above).
+                if isdefined(Base, :isvalid_file_crc)
+                    pji = only(filter(x -> endswith(x, ".ji"), readdir(perturb; join=true)))
+                    @test open(Base.isvalid_file_crc, pji) == false
+                end
 
                 okS, outS = run_julia(scenario_jl, ["STAMP", stash, jsd_src])
                 okT, outT = run_julia(scenario_jl, ["STALE", stash, jsd_src])

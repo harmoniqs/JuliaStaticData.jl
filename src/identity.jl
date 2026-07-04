@@ -133,6 +133,34 @@ function _write_checksum!(f::String, off::Int, checksum::UInt64)
     return checksum
 end
 
+# Rewrite the two trailer CRCs at the tail of a `.ji` so a stamped pair still
+# passes Base's `stale_cachefile`/`isprecompiled` validation (base/loading.jl:
+# `isvalid_file_crc` + `isvalid_pkgimage_crc`, v1.12.6:3358-3365):
+#
+#   [ ... ][ crc_so : UInt32 @ end-8 ][ crc_ji : UInt32 @ end-4 ]
+#
+#   crc_so = crc32c(whole `.so`)          — validated by `isvalid_pkgimage_crc`
+#   crc_ji = crc32c(`.ji` bytes 1:end-4)  — validated by `isvalid_file_crc`
+#
+# Order matters: `crc_so` sits inside the `crc_ji` range, so it is written first.
+# `crc_so` is only present/checked for split images; when `so === nothing`
+# (a non-split `.ji`) only `crc_ji` is rewritten. Must run LAST, after every
+# other byte edit to the pair (nonce, embedded header checksum) is final.
+function _rewrite_ji_trailer!(ji::String, so::Union{String,Nothing})
+    jb = read(ji)
+    n = length(jb)
+    n >= 8 || return nothing   # too small to carry a trailer; nothing to do
+    if so !== nothing
+        crc_so = crc32c(read(so))
+        jb[(n - 7):(n - 4)] .= reinterpret(UInt8, [crc_so])
+    end
+    crc_ji = crc32c(@view jb[1:(n - 4)])
+    jb[(n - 3):n] .= reinterpret(UInt8, [crc_ji])
+    write(ji, jb)
+    return (; crc_so = so === nothing ? nothing : reinterpret(UInt32, jb[(n - 7):(n - 4)])[1],
+              crc_ji = crc_ji)
+end
+
 # ── Public API ──────────────────────────────────────────────
 
 """
@@ -151,9 +179,17 @@ Handles both layouts:
   companion `.ji`'s worklist field is rewritten too and its checksum mirrored
   from the `.so`, so both headers agree (as the builder writes them).
 
+In both cases the `.ji`'s two **trailer CRCs** are also rewritten (whole-`.so`
+CRC + `.ji`-self CRC, at the file tail — see `isvalid_file_crc` /
+`isvalid_pkgimage_crc`, base/loading.jl:3358-3365 @ v1.12.6). JSD's own loader
+bypasses these, but rewriting them keeps a stamped pair valid under Base's
+`stale_cachefile`/`isprecompiled` path, so a depot-resident stamped image is not
+seen as stale by ordinary `using`/`import`.
+
 Pass either half of a split pair; the sibling is found automatically. With
-`self_crc=false` no checksum is recomputed — useful only for constructing a
-deliberately-stale image (which the loader will reject).
+`self_crc=false` no checksum is recomputed and the trailer is left untouched —
+useful only for constructing a deliberately-stale image (which the loader will
+reject).
 
 Returns `(; build_id_lo, checksum, ji, so)` where `checksum` is the new
 self-consistent 64-bit header checksum (or `nothing` if `self_crc=false`).
@@ -183,6 +219,14 @@ function stamp_identity!(path::String; build_id_lo::UInt64, self_crc::Bool=true)
         if newck !== nothing
             _write_checksum!(metafile, _image_layout(metafile).checksum_off, newck)
         end
+    end
+
+    # Rewrite the `.ji` trailer CRCs LAST (after every nonce/checksum edit is
+    # final) so the stamped pair still passes Base's `stale_cachefile` /
+    # `isprecompiled` validation. Only when keeping the image consistent
+    # (`self_crc=true`); a deliberately-stale stamp leaves the trailer untouched.
+    if self_crc && ji !== nothing
+        _rewrite_ji_trailer!(ji, so)
     end
 
     return (; build_id_lo=build_id_lo, checksum=newck, ji=ji, so=so)

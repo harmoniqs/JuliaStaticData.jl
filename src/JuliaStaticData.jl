@@ -64,6 +64,7 @@ include("protection.jl")
 export PkgImageHeader, WorklistEntry, DepModEntry
 export RemapSpec
 export VerificationReport, ProtectionReport
+export ClosureReport, MissingDep
 
 # Header
 export parse_header, inspect
@@ -72,7 +73,7 @@ export parse_header, inspect
 export remap, remap!
 
 # Loader
-export load_package_image, resolve_dep, resolve_all_deps
+export load_package_image, resolve_dep, resolve_all_deps, verify_closure
 
 # Identity stamping + verification
 export stamp_identity!, dry_verify
