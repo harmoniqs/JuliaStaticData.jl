@@ -260,6 +260,16 @@ function _dep_blob(tbl, m::Module)
     return (lo, hi)
 end
 
+# A dependency's live linkage blob span `[lo, hi)` paired with its parsed package
+# image (`.so`), used by content descriptors to enumerate the blob's own objects
+# (gctag boundaries) and const region. Defined here so `_describe_target` can name
+# it in its signature.
+struct _DepCtx
+    lo::UInt
+    hi::UInt
+    img::_PayloadImage
+end
+
 # ── Descriptor emission (builder side) ───────────────────────────────
 #
 # Describe a live object semantically. Priority: named entities (module,
@@ -496,7 +506,8 @@ end
 # Errors loudly if it cannot be described — a builder-side failure is cheap,
 # a consumer-side one is not.
 function _describe_target(root::Module, tbl, blob_lo::UInt, blob_hi::UInt,
-                          byte_offset::Int, dep_name::AbstractString)
+                          byte_offset::Int, dep_name::AbstractString;
+                          dep_ctx::Union{_DepCtx, Nothing} = nothing)
     ptr = blob_lo + UInt(byte_offset)
     (blob_lo <= ptr < blob_hi) ||
         error("emit_sidecar: target offset $byte_offset out of $dep_name blob " *
@@ -504,9 +515,19 @@ function _describe_target(root::Module, tbl, blob_lo::UInt, blob_hi::UInt,
     obj = unsafe_pointer_to_objref(Ptr{Cvoid}(ptr))
     d = _describe_object(obj, root, tbl, blob_lo, blob_hi)
     d !== nothing && return d
+    # No name and no build-stable anchor path: fall back to an order-independent
+    # CONTENT descriptor for the two kinds leg5 proved are semantically stable but
+    # positionally volatile — anonymous svecs and interned const-data strings.
+    if dep_ctx !== nothing
+        if obj isa Core.SimpleVector
+            return _describe_svec_content(obj, dep_ctx, byte_offset, dep_name)
+        elseif obj isa String
+            return _describe_const_data(obj, dep_ctx, byte_offset, dep_name)
+        end
+    end
     error("emit_sidecar: cannot describe target in $dep_name at offset $byte_offset " *
-          "(kind $(typeof(obj))): no named entity and no anchor+field-path found. " *
-          "repr=" * _safe_repr(obj))
+          "(kind $(typeof(obj))): no named entity, no anchor+field-path, and no " *
+          "content descriptor. repr=" * _safe_repr(obj))
 end
 
 function _safe_repr(obj)
@@ -516,6 +537,198 @@ function _safe_repr(obj)
         string(typeof(obj))
     end
     return length(s) > 200 ? s[1:200] : s
+end
+
+# ── Content descriptors: order-independent svec / const-data (leg5 §6) ─
+#
+# Some targets are anonymous objects with NO build-stable field path to a named
+# owner (the anchor BFS cannot reach them at any depth): type-cache / format-spec /
+# method-sig `SimpleVector`s and interned const-data `String`s. Their blob offset
+# shifts between builds AND the path that reaches them (type-cache slot order) is
+# build-volatile — so neither a raw offset nor an anchor descriptor is portable.
+#
+# They ARE describable by CONTENT, which is semantically stable: an svec's elements
+# are types / isbits leaves; a const `String`'s value is its text. We ship the
+# content and, on the consumer, reconstruct the element values and locate the live
+# object in the *consumer's* rebuilt dep blob whose content matches — by structure,
+# not by offset or order. Structurally-identical duplicates are pinned by their rank
+# within the equal-content cohort (blob-offset order), which leg5 measured stable for
+# the Altissimo cohorts.
+
+_pack(x)::Vector{UInt8} = (io = IOBuffer(); Serialization.serialize(io, x); take!(io))
+_unpack(b::Vector{UInt8}) = Serialization.deserialize(IOBuffer(b))
+
+# Interning-independent element equality: mutual subtyping for type elements (a
+# rebuild may hand back a non-`===` but structurally-identical type — esp. Tuple
+# types, which are not interned), value equality (+ exact type) for leaves.
+function _elem_eq(a, b)
+    if a isa Type && b isa Type
+        return a <: b && b <: a
+    elseif a isa Type || b isa Type
+        return false
+    else
+        return typeof(a) === typeof(b) && isequal(a, b)
+    end
+end
+
+function _svec_matches(sv::Core.SimpleVector, content)
+    length(sv) == length(content) || return false
+    @inbounds for i in eachindex(content)
+        (isassigned(sv, i) && _elem_eq(sv[i], content[i])) || return false
+    end
+    return true
+end
+
+# An svec element is describable-by-content iff it is a type or a serializable,
+# structurally-comparable leaf. (Types serialize by module+name+params and
+# reconstruct against the consumer's caches; leaves are self-describing.)
+_portable_leaf(x) = x isa Type || x isa Symbol || x isa AbstractString ||
+                    x isa Char || x isa Bool || x isa Number
+
+# The consumer-side (or builder-side) `.so` package image for a *loaded* module,
+# matched to that module's build-id. Needed to enumerate the dep blob's objects
+# (gctag boundaries) and const region for content matching.
+function _dep_so_path(pid::Base.PkgId, m::Module)
+    wanthi = UInt64(Base.module_build_id(m) >> 64)
+    cands = try
+        Base.find_all_in_cache_path(pid)
+    catch
+        String[]
+    end
+    for ji in cands
+        got = try
+            open(Base.isvalid_cache_header, ji)
+        catch
+            UInt64(0)
+        end
+        (got == 0 || got != wanthi) && continue
+        so = splitext(ji)[1] * ".so"
+        isfile(so) && return so
+    end
+    # Single unambiguous candidate: accept its companion .so even if the header
+    # probe was inconclusive.
+    if length(cands) == 1
+        so = splitext(cands[1])[1] * ".so"
+        isfile(so) && return so
+    end
+    return nothing
+end
+
+# Offsets (dep-blob byte offsets) of every live in-blob svec whose content matches.
+# Enumerates objects at the dep image's own gctag boundaries (object header at
+# `gp`, object data at `gp+8` = the reloc byte offset).
+function _match_svec_offsets(ctx::_DepCtx, content)
+    offs = Int[]
+    for gp in ctx.img.gctags
+        boff = gp + 8
+        ptr = ctx.lo + UInt(boff)
+        (ctx.lo <= ptr < ctx.hi) || continue
+        obj = try
+            unsafe_pointer_to_objref(Ptr{Cvoid}(ptr))
+        catch
+            continue
+        end
+        (obj isa Core.SimpleVector && _svec_matches(obj, content)) && push!(offs, boff)
+    end
+    return sort!(offs)
+end
+
+# Offsets of every const-region `String` object whose serialized image
+# (`[len:8][bytes][NUL]`) matches `s`. The object offset IS the length-prefix
+# position (a `String`'s objref points at its length field).
+function _match_const_string_offsets(ctx::_DepCtx, s::AbstractString)
+    P = ctx.img.P
+    body = codeunits(String(s))
+    n = length(body)
+    pat = Vector{UInt8}(undef, 8 + n + 1)
+    let L = UInt64(n)
+        @inbounds for k in 0:7
+            pat[k + 1] = UInt8((L >> (8k)) & 0xff)
+        end
+    end
+    @inbounds for k in 1:n
+        pat[8 + k] = body[k]
+    end
+    pat[end] = 0x00
+    m = length(pat)
+    offs = Int[]
+    lo = ctx.img.const_lo
+    hi = ctx.img.const_hi
+    p = lo
+    @inbounds while p <= hi - m
+        ok = true
+        for k in 1:m
+            if P[p + k] != pat[k]
+                ok = false
+                break
+            end
+        end
+        ok && push!(offs, p)
+        p += 1
+    end
+    return offs
+end
+
+# Pick the matched offset for a target given its cohort rank. A single match is
+# taken directly; an equal-content cohort is pinned by rank iff the consumer cohort
+# has the same size (otherwise a set-delta made it ambiguous — fail loudly rather
+# than guess a structurally-identical but semantically-wrong sibling).
+function _pick_ranked(offs::Vector{Int}, rank::Int, cohort::Int, what::AbstractString)
+    isempty(offs) && error("$what: no content match in consumer dep blob")
+    if length(offs) == 1 && (cohort <= 1 || rank == 1)
+        return offs[1]
+    end
+    (cohort >= 1 && length(offs) == cohort && 1 <= rank <= cohort) &&
+        return offs[rank]
+    error("$what: content match is ambiguous (consumer found $(length(offs)) " *
+          "candidates; builder cohort=$cohort rank=$rank) — cannot disambiguate")
+end
+
+# Builder-side: describe an undescribable target by content, WITH a self-check that
+# the reconstructed content re-locates the very object we are describing (so a lossy
+# content encoding fails cheaply here, never on the consumer).
+function _describe_svec_content(obj::Core.SimpleVector, ctx::_DepCtx, boff::Int,
+                                dep_name::AbstractString)
+    n = length(obj)
+    content = Vector{Any}(undef, n)
+    for i in 1:n
+        isassigned(obj, i) ||
+            error("emit_sidecar: $dep_name svec@$boff has an undefined element $i")
+        e = obj[i]
+        _portable_leaf(e) ||
+            error("emit_sidecar: $dep_name svec@$boff element $i is not " *
+                  "content-describable ($(typeof(e))): " * _safe_repr(e))
+        content[i] = e
+    end
+    # Self-check against the *round-tripped* payload — exactly the reconstruction
+    # the consumer will match against — so a lossy encoding (e.g. a free TypeVar,
+    # which a fresh deserialize renames and structural match then misses) fails
+    # cheaply HERE, never as a silent mis-resolve on the consumer.
+    payload = _pack(content)
+    content2 = _unpack(payload)
+    offs = _match_svec_offsets(ctx, content2)
+    r = findfirst(==(boff), offs)
+    r === nothing &&
+        error("emit_sidecar: $dep_name svec@$boff — content self-check failed " *
+              "(round-tripped content did not re-locate the target; matches=$offs). " *
+              "The svec is not faithfully content-describable (free type variables?). " *
+              "svec=" * _safe_repr(obj))
+    return RefDescriptor(:svec_content, Symbol[], Symbol(""), nothing,
+                         Tuple{Symbol, Any}[], payload, r, length(offs))
+end
+
+function _describe_const_data(obj, ctx::_DepCtx, boff::Int, dep_name::AbstractString)
+    obj isa String ||
+        error("emit_sidecar: $dep_name const-data target@$boff is a " *
+              "$(typeof(obj)); only interned Strings are content-describable")
+    payload = _pack(obj)
+    offs = _match_const_string_offsets(ctx, _unpack(payload)::String)
+    r = findfirst(==(boff), offs)
+    r === nothing &&
+        error("emit_sidecar: $dep_name const String@$boff — content self-check " *
+              "failed (byte image did not re-locate; matches=$offs)")
+    return RefDescriptor(:const_data, Symbol[], Symbol(""), nothing,
+                         Tuple{Symbol, Any}[], payload, r, length(offs))
 end
 
 # ── Descriptor resolution (consumer side) ────────────────────────────
@@ -554,6 +767,10 @@ function _resolve_descriptor(d::RefDescriptor, root::Module)
             cur = _walk_step(cur, op, arg)
         end
         return cur
+    elseif d.kind === :svec_content || d.kind === :const_data
+        error("translate!: $(d.kind) is a content descriptor — resolve it against a " *
+              "dep blob with `_resolve_new_offset`, not `_resolve_descriptor` " *
+              "(it has no live object to return, only a matched offset)")
     else
         error("translate!: unknown descriptor kind $(d.kind)")
     end
@@ -566,6 +783,27 @@ function _walk_step(cur, op::Symbol, arg)
         return getfield(cur, arg)
     else
         error("translate!: unknown walk op $op")
+    end
+end
+
+# Resolve a CONTENT descriptor (`:svec_content` / `:const_data`) to the new byte
+# offset of the matching object in the consumer dep blob `ctx`. (Named/anchor kinds
+# resolve to a live object whose offset is `jl_value_ptr - blob_base`; content kinds
+# must instead SEARCH the consumer blob, since the object has no name and no stable
+# path — see `_match_svec_offsets` / `_match_const_string_offsets`.)
+function _resolve_new_offset(t::RefTarget, ctx::_DepCtx)
+    d = t.descriptor
+    tag = "$(t.dep_name)@$(t.old_offset)"
+    if d.kind === :svec_content
+        content = _unpack(d.payload)
+        offs = _match_svec_offsets(ctx, content)
+        return _pick_ranked(offs, d.rank, d.cohort, "svec_content $tag")
+    elseif d.kind === :const_data
+        s = _unpack(d.payload)
+        offs = _match_const_string_offsets(ctx, s)
+        return _pick_ranked(offs, d.rank, d.cohort, "const_data $tag")
+    else
+        error("translate!: _resolve_new_offset called on non-content descriptor $(d.kind)")
     end
 end
 
@@ -588,11 +826,20 @@ separately-precompiled *pkgimage* dependency:
 2. finds the dep's linkage blob via `jl_linkage_blobs` (`base + byte_offset` =
    the live target object),
 3. emits a semantic [`RefDescriptor`](@ref) for that object — a named entity
-   (module / binding / type / typename / function) where possible, otherwise a
-   nearest-named-owner **anchor** with a deterministic field path.
+   (module / binding / type / typename / function) where possible; otherwise a
+   nearest-named-owner **anchor** with a deterministic field path; otherwise, for
+   the two kinds leg5 proved are semantically stable but positionally volatile —
+   anonymous `SimpleVector`s (format-spec / method-sig / type-cache svecs) and
+   interned const-data `String`s — an **order-independent content descriptor**
+   (`:svec_content` / `:const_data`): the target's element values / string content,
+   which the consumer reconstructs and re-locates in its *own* rebuilt dep blob by
+   structural content match (see [`RefDescriptor`](@ref)). Each content descriptor
+   is self-checked at emit time against its own round-tripped payload, so a target
+   that is not faithfully content-describable (e.g. a svec with free type
+   variables) fails HERE rather than mis-resolving on the consumer.
 
-If a target can be described by neither a name nor an anchor, `emit_sidecar`
-errors loudly (a builder-side failure is cheap; a consumer-side one is not).
+If a target can be described by none of the above, `emit_sidecar` errors loudly
+(a builder-side failure is cheap; a consumer-side one is not).
 
 # Arguments
 - `depot`: if given, prepended to `JULIA_DEPOT_PATH` is *not* done here — the
@@ -644,8 +891,10 @@ function emit_sidecar(images::Vector{String}; depot = nothing, require::Bool = t
         # load more deps, appending blobs; a cached table would miss them).
         tbl = _blob_table()
 
-        # Blob base per depsidx (against the fresh blob table).
-        blobinfo = Dict{Int, Tuple{Module, UInt, UInt}}()
+        # Blob base + parsed image per depsidx (against the fresh blob table). The
+        # parsed dep image (its own `.so`) supplies the gctag boundaries / const
+        # region that content descriptors search when a target has no name/anchor.
+        blobinfo = Dict{Int, Tuple{Module, UInt, UInt, Union{_DepCtx, Nothing}}}()
         targets = RefTarget[]
         for key in order
             depsidx, boff = key
@@ -655,10 +904,19 @@ function emit_sidecar(images::Vector{String}; depot = nothing, require::Bool = t
                 bl = _dep_blob(tbl, m)
                 bl === nothing && error("emit_sidecar: no linkage blob for dep $(dep.name) " *
                                         "(depsidx $depsidx) — is it loaded?")
-                (m, bl[1], bl[2])
+                ctx = nothing
+                sop = _dep_so_path(Base.PkgId(dep.uuid, dep.name), m)
+                if sop !== nothing
+                    ctx = try
+                        _DepCtx(bl[1], bl[2], _parse_payload(sop))
+                    catch
+                        nothing
+                    end
+                end
+                (m, bl[1], bl[2], ctx)
             end
-            m, lo, hi = info
-            d = _describe_target(m, tbl, lo, hi, boff, dep.name)
+            m, lo, hi, ctx = info
+            d = _describe_target(m, tbl, lo, hi, boff, dep.name; dep_ctx = ctx)
             push!(targets, RefTarget(depsidx, dep.name,
                                      UInt128(dep.uuid.value), boff, d,
                                      wordval[key], sort!(bytarget[key])))
@@ -722,16 +980,47 @@ function translate!(image_path::String, sidecar; depot = nothing,
         @warn "translate!: sidecar emitted under Julia $(entry.julia_version), running $(VERSION)"
 
     if require
-        for t in entry.targets
+        # Require every dependency the image records (not only the ones that own a
+        # target): a content descriptor's element types can name *any* required
+        # module (e.g. an LLVM svec whose element is `Tuple{Printf.Spec{Val{'s'}}}`),
+        # and those modules must be loaded before the content is reconstructed.
+        for dep in img.required
+            _is_sysimage_dep(dep) && continue
             try
-                Base.require(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
+                Base.require(Base.PkgId(dep.uuid, dep.name))
             catch e
-                @warn "translate!: could not require dep $(t.dep_name)" exception = e
+                @warn "translate!: could not require dep $(dep.name)" exception = e
             end
         end
     end
     tbl = _blob_table()
-    blobbase = Dict{Int, UInt}()
+
+    # Per-dep resolution context: blob base `lo` (always, for named/anchor targets)
+    # plus the parsed dep image `ctx` (only needed for content descriptors, which
+    # enumerate the dep blob's own objects to locate a content match).
+    depinfo = Dict{Int, NamedTuple{(:m, :lo, :ctx),
+                    Tuple{Union{Module, Nothing}, UInt, Union{_DepCtx, Nothing}}}}()
+    getinfo(t) = get!(depinfo, t.depsidx) do
+        pid = Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name)
+        m = try
+            Base.root_module(pid)
+        catch
+            nothing
+        end
+        m === nothing && return (m = nothing, lo = UInt(0), ctx = nothing)
+        bl = _dep_blob(tbl, m)
+        bl === nothing && return (m = m, lo = UInt(0), ctx = nothing)
+        ctx = nothing
+        sop = _dep_so_path(pid, m)
+        if sop !== nothing
+            ctx = try
+                _DepCtx(bl[1], bl[2], _parse_payload(sop))
+            catch
+                nothing
+            end
+        end
+        return (m = m, lo = bl[1], ctx = ctx)
+    end
 
     so = copy(img.bytes)            # edit the raw file bytes (payload_base offset)
     words_rewritten = 0
@@ -741,24 +1030,28 @@ function translate!(image_path::String, sidecar; depot = nothing,
     failed = String[]
 
     for t in entry.targets
-        # Resolve the target's dep blob base on the consumer side.
-        base = get!(blobbase, t.depsidx) do
-            m = Base.root_module(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
-            bl = _dep_blob(tbl, m)
-            bl === nothing ? UInt(0) : bl[1]
-        end
-        if base == 0
+        info = getinfo(t)
+        if info.lo == 0
             push!(failed, "$(t.dep_name)@$(t.old_offset): dep not loaded")
             continue
         end
-        root = Base.root_module(Base.PkgId(Base.UUID(t.dep_uuid), t.dep_name))
-        obj = try
-            _resolve_descriptor(t.descriptor, root)
+        is_content = t.descriptor.kind === :svec_content || t.descriptor.kind === :const_data
+        if is_content && info.ctx === nothing
+            push!(failed, "$(t.dep_name)@$(t.old_offset): content descriptor but " *
+                          "dep package image not found for blob enumeration")
+            continue
+        end
+        newoff = try
+            if is_content
+                _resolve_new_offset(t, info.ctx::_DepCtx)
+            else
+                obj = _resolve_descriptor(t.descriptor, info.m::Module)
+                Int(_vptr(obj) - info.lo)
+            end
         catch e
             push!(failed, "$(t.dep_name)@$(t.old_offset): $(sprint(showerror, e))")
             continue
         end
-        newoff = Int(_vptr(obj) - base)
         newoff >= 0 && newoff % 8 == 0 ||
             (push!(failed, "$(t.dep_name)@$(t.old_offset): bad new offset $newoff"); continue)
         resolved += 1

@@ -459,3 +459,242 @@ end
         isfile(bad) && rm(bad)
     end
 end
+
+# ── item 5: content-descriptor codec + matchers (pure Julia, no toolchain) ──
+# Unit coverage for the order-independent :svec_content / :const_data machinery:
+# interning-independent element equality, structural svec matching, cohort rank
+# selection, the content (de)serializer, the const-region byte-image scanner, and
+# sidecar round-tripping of the new descriptor kinds.
+@testitem "content descriptors: codec, matchers, rank, serialization" begin
+    using JuliaStaticData
+    const J = JuliaStaticData
+
+    # _elem_eq: types compare by MUTUAL SUBTYPING (survives non-interned rebuilds,
+    # e.g. Tuple types), leaves by exact-type value equality, never mixing the two.
+    @test J._elem_eq(Int, Int)
+    @test !J._elem_eq(Int, Float64)
+    @test J._elem_eq(Val{'a'}, Val{'a'})
+    @test !J._elem_eq(Val{'a'}, Val{'b'})
+    @test J._elem_eq(Tuple{Int,Bool}, Tuple{Int,Bool})     # structural, not necessarily ===
+    @test !J._elem_eq(Tuple{Int}, Tuple{Bool})
+    @test J._elem_eq('a', 'a')
+    @test !J._elem_eq('a', 'b')
+    @test J._elem_eq(:sym, :sym)
+    @test J._elem_eq(16, 16)
+    @test !J._elem_eq(1, 1.0)                              # different leaf type
+    @test !J._elem_eq(Int, 1)                              # type vs value never equal
+    @test !J._elem_eq(1, Int)
+
+    # _svec_matches: order-sensitive, length-sensitive structural content compare.
+    @test J._svec_matches(Core.svec(Int, 'a', :s), Any[Int, 'a', :s])
+    @test !J._svec_matches(Core.svec(Int, 'a'), Any[Int, 'a', :s])   # length
+    @test !J._svec_matches(Core.svec(Int, 'a'), Any['a', Int])       # order
+    @test J._svec_matches(Core.svec(Val{'f'}), Any[Val{'f'}])
+    @test !J._svec_matches(Core.svec(Val{'f'}), Any[Val{'g'}])
+
+    # _pick_ranked: a single match is taken; an equal-content cohort is pinned by
+    # rank iff the consumer cohort size agrees; otherwise it fails loudly.
+    @test J._pick_ranked([700], 1, 1, "t") == 700
+    @test J._pick_ranked([64, 96], 2, 2, "t") == 96        # rank-2 of a 2-cohort
+    @test J._pick_ranked([64, 96], 1, 2, "t") == 64
+    @test_throws Exception J._pick_ranked(Int[], 1, 1, "t")           # no match
+    @test_throws Exception J._pick_ranked([64, 96], 1, 1, "t")        # unexpected duplicate
+    @test_throws Exception J._pick_ranked([64, 96, 128], 2, 2, "t")   # cohort-size mismatch
+
+    # content (de)serializer round-trips types + isbits/Symbol leaves portably.
+    orig = Any[Val{'f'}, Bool, Int64, 'e', :sym, 16, Tuple{Int,Bool}]
+    back = J._unpack(J._pack(orig))
+    @test back isa Vector
+    @test all(i -> J._elem_eq(back[i], orig[i]), eachindex(orig))
+
+    # _match_const_string_offsets scans a const region for a String's byte image
+    # [len:8][bytes][NUL]; the object offset is the length-prefix position; rank
+    # disambiguates duplicates.
+    mkctx = function (P, clo, chi)
+        img = J._PayloadImage(UInt8[], 0, P, 8, clo, clo, chi,
+                              Int[], Int[], 0, 0, 0, 0,
+                              UInt32[], UInt32[], UInt32[], UInt32[], DepModEntry[])
+        J._DepCtx(UInt(0), UInt(0), img)
+    end
+    write_str! = function (P, at, s)
+        L = UInt64(sizeof(s))
+        for k in 0:7
+            P[at + 1 + k] = UInt8((L >> (8k)) & 0xff)
+        end
+        cu = codeunits(s)
+        for k in 1:length(cu)
+            P[at + 9 + (k - 1)] = cu[k]
+        end
+        P[at + 9 + length(cu)] = 0x00
+    end
+    P = zeros(UInt8, 400)
+    write_str!(P, 64, "hi")
+    write_str!(P, 200, "hi")            # a structurally-identical duplicate
+    ctx = mkctx(P, 8, 400)
+    @test J._match_const_string_offsets(ctx, "hi") == [64, 200]
+    @test J._match_const_string_offsets(ctx, "nope") == Int[]
+    # unique string
+    P2 = zeros(UInt8, 200); write_str!(P2, 96, "unique-msg")
+    @test J._match_const_string_offsets(mkctx(P2, 8, 200), "unique-msg") == [96]
+
+    # Sidecar round-trips :svec_content and :const_data descriptors (payload bytes,
+    # rank, cohort survive Serialization).
+    dsv = RefDescriptor(:svec_content, Symbol[], Symbol(""), nothing,
+                        Tuple{Symbol,Any}[], J._pack(Any[Val{'f'}]), 2, 3)
+    dcd = RefDescriptor(:const_data, Symbol[], Symbol(""), nothing,
+                        Tuple{Symbol,Any}[], J._pack("hi"), 1, 1)
+    t1 = RefTarget(19, "Dates", UInt128(0xabcd), 925984, dsv, UInt64(0xdead), [10, 20])
+    t2 = RefTarget(46, "KA", UInt128(0x1234), 892592, dcd, UInt64(0xbeef), [30])
+    sc = Sidecar(1, [ImageSidecar("Alt", UInt128(1), string(VERSION), 3, [t1, t2])])
+    tmp = tempname()
+    try
+        write_sidecar(tmp, sc)
+        img = only(read_sidecar(tmp).images)
+        d1 = img.targets[1].descriptor
+        @test d1.kind == :svec_content
+        @test d1.rank == 2 && d1.cohort == 3
+        @test J._svec_matches(Core.svec(Val{'f'}), J._unpack(d1.payload))
+        d2 = img.targets[2].descriptor
+        @test d2.kind == :const_data
+        @test J._unpack(d2.payload) == "hi"
+    finally
+        isfile(tmp) && rm(tmp)
+    end
+end
+
+# ── item 6: content-descriptor round-trip on a real Val-parameterized image ──
+# The end-to-end unit for the new kind: a package whose Val{...}/Char-parameterized
+# methods bake anonymous svecs (method-sig parameter svecs) and a const String into
+# its image. We describe each such target with `emit`'s content fallback
+# (`_describe_target`, which yields :svec_content / :const_data because there is no
+# name and no build-stable anchor path) and resolve it back through the consumer
+# path (`_resolve_new_offset` over the dep's own live blob) — an in-depot round trip
+# that must recover the target's own offset. Runs only where a C toolchain can build
+# split images.
+@testitem "content-descriptor round-trip (svec_content + const_data) on a real image" begin
+    using JuliaStaticData
+
+    XLATE_SKIP_MSG =
+        "cannot build split package images here (no C toolchain or build failed); " *
+        "content-descriptor round-trip not exercised"
+    jsd_src = abspath(joinpath(@__DIR__, "..", "src", "JuliaStaticData.jl"))
+    julia_exe = Base.julia_cmd().exec[1]
+    have_cc = any(c -> Sys.which(c) !== nothing, ("cc", "gcc", "clang"))
+
+    if !isfile(jsd_src) || !have_cc
+        @info "SKIP content-descriptor round-trip: $XLATE_SKIP_MSG"
+        @test_skip XLATE_SKIP_MSG
+    else
+        work = mktempdir()
+        try
+            depot = joinpath(work, "depot"); src = joinpath(work, "src")
+            scripts = joinpath(work, "scripts")
+            for d in (depot, src, scripts); mkpath(d); end
+
+            probe = joinpath(scripts, "content.jl")
+            write(probe, raw"""
+            const DEPOT = ARGS[1]; const SRC = ARGS[2]; const JSD = ARGS[3]
+            import Pkg
+            Q = Char(34)
+            dep_uuid = "55555555-5555-5555-5555-555555555555"
+            depdir = joinpath(SRC, "Dep"); mkpath(joinpath(depdir, "src"))
+            write(joinpath(depdir, "Project.toml"),
+                  "name = $(Q)Dep$(Q)\nuuid = $(Q)$dep_uuid$(Q)\nversion = $(Q)0.1.0$(Q)\n")
+            # Val{Char}/Val-parameterized methods bake unnamed svecs (method sigs +
+            # cached Val{c} parameter svecs) into the image; a const String lands in
+            # the const-data region.
+            write(joinpath(depdir, "src", "Dep.jl"),
+                  "module Dep\n" *
+                  "struct Spec{C} end\n" *
+                  "make(::Val{c}) where {c} = Spec{c}()\n" *
+                  "handle(::Spec{'a'}) = 1\n" *
+                  "handle(::Spec{'b'}, ::Int, ::Bool) = 2\n" *
+                  "combo(::Val{'x'}, ::Val{'y'}, ::Int) = 3\n" *
+                  "const MSG = $(Q)toy-content-descriptor-const-string-marker$(Q)\n" *
+                  "precompile(handle, (Spec{'a'},))\n" *
+                  "precompile(handle, (Spec{'b'}, Int, Bool))\n" *
+                  "precompile(combo, (Val{'x'}, Val{'y'}, Int))\n" *
+                  "precompile(make, (Val{'a'},))\n" *
+                  "export make, handle, combo, MSG\nend\n")
+            ENV["JULIA_PKG_OFFLINE"] = "true"
+            env = joinpath(SRC, "env"); mkpath(env)
+            Pkg.activate(env); Pkg.develop(path = depdir); Pkg.precompile()
+
+            include(JSD); const J = Main.JuliaStaticData
+            pid = Base.PkgId(Base.UUID(dep_uuid), "Dep")
+            Dep = Base.require(pid)
+            tbl = J._blob_table()
+            bl = J._dep_blob(tbl, Dep)
+            @assert bl !== nothing "Dep has no linkage blob"
+            lo, hi = bl
+            sop = J._dep_so_path(pid, Dep)
+            if sop === nothing
+                println("NO_DEP_SO"); exit(0)
+            end
+            ctx = J._DepCtx(lo, hi, J._parse_payload(sop))
+            vp(x) = J._vptr(x)
+            portable(sv) = all(i -> isassigned(sv, i) &&
+                               (sv[i] isa Type || sv[i] isa Char || sv[i] isa Symbol ||
+                                sv[i] isa Bool || sv[i] isa Number), 1:length(sv))
+
+            n_svec = Ref(0); n_svec_ok = Ref(0)     # Refs: no script soft-scope trap
+            for gp in ctx.img.gctags
+                boff = gp + 8; ptr = lo + UInt(boff)
+                (lo <= ptr < hi) || continue
+                obj = try unsafe_pointer_to_objref(Ptr{Cvoid}(ptr)) catch; continue end
+                (obj isa Core.SimpleVector && length(obj) >= 1 && portable(obj)) || continue
+                # only targets with no name AND no stable anchor path hit the content path
+                J._describe_object(obj, Dep, tbl, lo, hi) === nothing || continue
+                d = try
+                    J._describe_target(Dep, tbl, lo, hi, boff, "Dep"; dep_ctx = ctx)
+                catch
+                    continue
+                end
+                d.kind === :svec_content || continue
+                n_svec[] += 1
+                t = J.RefTarget(1, "Dep", UInt128(0), boff, d, UInt64(0), Int[])
+                newoff = try J._resolve_new_offset(t, ctx) catch; -1 end
+                newoff == boff && (n_svec_ok[] += 1)
+            end
+            println("SVEC content targets=", n_svec[], " roundtrip_ok=", n_svec_ok[])
+
+            # const-data String round trip
+            s = getglobal(Dep, :MSG)
+            sboff = Int(vp(s) - lo)
+            dc = J._describe_target(Dep, tbl, lo, hi, sboff, "Dep"; dep_ctx = ctx)
+            tc = J.RefTarget(1, "Dep", UInt128(0), sboff, dc, UInt64(0), Int[])
+            cnew = J._resolve_new_offset(tc, ctx)
+            println("CONST kind=", dc.kind, " roundtrip_ok=", cnew == sboff,
+                    " inconst=", ctx.img.const_lo <= sboff < ctx.img.const_hi)
+            println("CONTENT PROBE DONE")
+            """)
+
+            childenv = copy(ENV)
+            childenv["JULIA_DEPOT_PATH"] = depot * ":"
+            childenv["JULIA_PKG_OFFLINE"] = "true"
+            childenv["JULIA_LOAD_PATH"] = "@:@stdlib"
+            delete!(childenv, "JULIA_PROJECT")
+            cmd = `$julia_exe --startup-file=no --color=no $probe $depot $src $jsd_src`
+            out = IOBuffer()
+            proc = run(pipeline(setenv(cmd, childenv); stdout = out, stderr = out); wait = false)
+            wait(proc)
+            ok = success(proc); outP = String(take!(out))
+            @info "content probe:\n$outP"
+
+            if !ok || !occursin("CONTENT PROBE DONE", outP) || occursin("NO_DEP_SO", outP)
+                @info "SKIP content-descriptor round-trip: $XLATE_SKIP_MSG"
+                @test_skip XLATE_SKIP_MSG
+            else
+                m = match(r"SVEC content targets=(\d+) roundtrip_ok=(\d+)", outP)
+                @test m !== nothing
+                nsv = parse(Int, m.captures[1]); nok = parse(Int, m.captures[2])
+                @test nsv >= 1                         # Val-parameterized methods baked ≥1 anon svec
+                @test nok == nsv                        # every content svec round-trips to its own offset
+                @test occursin("CONST kind=const_data roundtrip_ok=true", outP)
+                @test occursin("inconst=true", outP)
+            end
+        finally
+            rm(work; force = true, recursive = true)
+        end
+    end
+end

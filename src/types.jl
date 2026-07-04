@@ -204,20 +204,45 @@ semantically stable entities. `RefDescriptor` encodes them by *kind*:
   for the named type `T`.
 - `:function` — a function / singleton instance (resolved via `getglobal`).
 - `:anchor`   — an anonymous object (`SimpleVector`, `UnionAll`, a cached tuple,
-  a method signature) that has no name of its own. Described as a named `owner`
-  descriptor plus a deterministic `fieldpath` walked from that owner to the
-  target. This is leg5's "nearest named owner + field path" semantics.
+  a method signature) that has no name of its own but IS reachable from a named
+  owner by a deterministic (build-stable) field path. Described as a named `owner`
+  descriptor plus a `fieldpath` walked from that owner to the target. This is
+  leg5's "nearest named owner + field path" semantics.
+- `:svec_content` — an anonymous `Core.SimpleVector` (format-spec / method-sig /
+  type-cache svec, e.g. `svec(Val{'f'})`, `svec('e')`) with **no** deterministic
+  field path, because the type-cache ordering that reaches it is build-volatile
+  (leg5 RESULTS §6). Described **order-independently** by its per-element content:
+  `payload` is a serialized `Vector` of the elements (each a `Type` or an
+  isbits/Symbol/String leaf — semantically stable, reconstructible consumer-side).
+  Resolved by reconstructing the element values and locating the live in-blob svec
+  whose content matches structurally (mutual subtyping for type elements). When two
+  structurally-identical svecs share the blob, `rank`/`cohort` pin the right one by
+  blob order within the equal-content cohort.
+- `:const_data` — a const-data-region object with no gctag boundary and no name
+  (measured: interned `String`s such as error messages). Described by its value
+  (`payload` = serialized value); resolved by scanning the consumer dep's const
+  region for the object's byte image (`[len][bytes][NUL]` for a `String`),
+  `rank`/`cohort` disambiguating duplicates.
 
 # Fields
 - `kind`: one of the symbols above
 - `modpath`: submodule path from the dep root module (`Symbol[]` = the root itself)
 - `name`: binding / type / typename / function name (unused, `Symbol("")`, for
-  `:module` and `:anchor`)
+  `:module`, `:anchor`, `:svec_content`, `:const_data`)
 - `owner`: for `:anchor`, the named descriptor of the object to start walking
-  from; `nothing` for the named kinds
+  from; `nothing` for the other kinds
 - `fieldpath`: for `:anchor`, the ordered walk steps `(op, arg)` where `op` is
   `:getfield` (`getfield(cur, arg)`), `:getindex` (`cur[arg]`, e.g. a
   `SimpleVector`), or `:property` (`getproperty(cur, arg)`, e.g. `T.parameters`)
+- `payload`: for `:svec_content` / `:const_data`, the `Serialization` bytes of the
+  content (svec element `Vector`, or the const value); empty (`UInt8[]`) otherwise.
+  Kept as raw bytes so the sidecar itself deserializes without any dep module
+  loaded — the content is unpacked only during resolution, after the deps are
+  `Base.require`d.
+- `rank`, `cohort`: for content-matched kinds, the 1-based position of the target
+  within its equal-content cohort (sorted by builder blob offset) and that cohort's
+  size, so a consumer with the same cohort can pick the corresponding member
+  deterministically. `0` when not applicable (named/anchor kinds, or a unique match).
 """
 struct RefDescriptor
     kind::Symbol
@@ -225,10 +250,18 @@ struct RefDescriptor
     name::Symbol
     owner::Union{RefDescriptor, Nothing}
     fieldpath::Vector{Tuple{Symbol, Any}}
+    payload::Vector{UInt8}
+    rank::Int
+    cohort::Int
 end
 
 RefDescriptor(kind::Symbol, modpath::Vector{Symbol}, name::Symbol) =
-    RefDescriptor(kind, modpath, name, nothing, Tuple{Symbol, Any}[])
+    RefDescriptor(kind, modpath, name, nothing, Tuple{Symbol, Any}[], UInt8[], 0, 0)
+
+RefDescriptor(kind::Symbol, modpath::Vector{Symbol}, name::Symbol,
+              owner::Union{RefDescriptor, Nothing},
+              fieldpath::Vector{Tuple{Symbol, Any}}) =
+    RefDescriptor(kind, modpath, name, owner, fieldpath, UInt8[], 0, 0)
 
 """
     RefTarget

@@ -50,6 +50,14 @@ productization of the bundle-v2 research pipeline, legs 4-5). The builder emits 
 semantic [`Sidecar`](@ref); the consumer translates a copy of the image against
 it, loads it, and runs the post-load type-hash repair.
 
+Each target is described by a [`RefDescriptor`](@ref): a **named** entity
+(`:module` / `:binding` / `:type` / `:typename` / `:function`), a nearest-named
+`:anchor` + field path, or — for anonymous objects with no build-stable path
+(format-spec / method-sig / type-cache svecs, interned const-data strings) — an
+**order-independent content descriptor** (`:svec_content` / `:const_data`) that
+the consumer re-locates in its own rebuilt dep blob by structural content match
+rather than by offset or cache order.
+
 ```@docs
 emit_sidecar
 translate!
