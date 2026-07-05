@@ -35,6 +35,7 @@ See also: [`parse_header`](@ref), [`remap`](@ref), [`load_package_image`](@ref),
 module JuliaStaticData
 
 using Base: UUID
+using CRC32c: crc32c
 
 # Types (must be loaded first — other modules depend on these)
 include("types.jl")
@@ -48,6 +49,9 @@ include("remap.jl")
 # Custom loading path (parallel to Base)
 include("loader.jl")
 
+# Identity stamping (nonce + self-consistent CRC) and pre-load verification
+include("identity.jl")
+
 # Optional monkey-patch mode
 include("hooks.jl")
 
@@ -60,6 +64,7 @@ include("protection.jl")
 export PkgImageHeader, WorklistEntry, DepModEntry
 export RemapSpec
 export VerificationReport, ProtectionReport
+export ClosureReport, MissingDep
 
 # Header
 export parse_header, inspect
@@ -68,7 +73,10 @@ export parse_header, inspect
 export remap, remap!
 
 # Loader
-export load_package_image, resolve_dep, resolve_all_deps
+export load_package_image, resolve_dep, resolve_all_deps, verify_closure
+
+# Identity stamping + verification
+export stamp_identity!, dry_verify
 
 # Hooks
 export install_hooks!, uninstall_hooks!

@@ -119,6 +119,68 @@ struct VerificationReport
     is_sound::Bool
 end
 
+# ── Closure verification types ──────────────────────────────
+
+"""
+    MissingDep
+
+One unsatisfied dependency identity found by [`verify_closure`](@ref): a
+`required_modules` entry of some image in the set that is provided neither by
+another image in the set nor by an already-loaded module.
+
+# Fields
+- `required_by`: path of the image whose header records this dependency
+- `name`, `uuid`: the dependency module's name and UUID
+- `build_id`: the 128-bit identity the image records (`hi << 64 | lo`)
+- `reason`:
+  - `:absent` — no image in the set and no loaded module offers this module
+    *name* at all. Loading would fail *cleanly* in `resolve_dep`.
+  - `:mixed_lineage` — the name IS offered, but only under a **different**
+    build-id. This is the dangerous case the closure law targets: mixing a
+    stamped/new-lineage dep with an old-lineage consumer segfaults in
+    `jl_validate_binding_partition` at restore time.
+- `other_lineages`: the differing build-ids seen under `name` (evidence for a
+  `:mixed_lineage` verdict; empty for `:absent`)
+"""
+struct MissingDep
+    required_by::String
+    name::String
+    uuid::Base.UUID
+    build_id::UInt128
+    reason::Symbol
+    other_lineages::Vector{UInt128}
+end
+
+"""
+    ClosureReport
+
+Result of [`verify_closure`](@ref): whether a set of package images is CLOSED
+under `required_modules` — i.e. every non-sysimage/stdlib dependency identity any
+image references is provided either by another image in the set or by an
+already-loaded module.
+
+Loading a set that is *not* closed risks a segfault in
+`jl_validate_binding_partition` when lineages are mixed (some deps resolved from
+stamped/new-lineage images, others from old-lineage ones), so this check is meant
+to run BEFORE any `ccall` into the restore path.
+
+# Fields
+- `ok`: `true` iff every path parsed and every checked dependency is satisfied
+- `paths`: the image set that was checked
+- `provided`: number of distinct module identities offered by the set
+- `required`: number of non-sysimage dependency references that were checked
+- `missing`: the unsatisfied dependencies (see [`MissingDep`](@ref))
+- `messages`: human-readable diagnostics (parse errors + one line per missing dep)
+"""
+struct ClosureReport
+    ok::Bool
+    paths::Vector{String}
+    provided::Int
+    required::Int
+    missing::Vector{MissingDep}
+    messages::Vector{String}
+end
+
 # ── Protection analysis types ───────────────────────────────
 
 """

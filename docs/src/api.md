@@ -9,6 +9,8 @@ DepModEntry
 RemapSpec
 VerificationReport
 ProtectionReport
+ClosureReport
+MissingDep
 ```
 
 ## Header Inspection
@@ -31,6 +33,7 @@ remap!
 load_package_image
 resolve_dep
 resolve_all_deps
+verify_closure
 ```
 
 ## Transparent Loading Hooks
