@@ -36,6 +36,7 @@ module JuliaStaticData
 
 using Base: UUID
 using CRC32c: crc32c
+import Serialization
 
 # Types (must be loaded first — other modules depend on these)
 include("types.jl")
@@ -52,6 +53,9 @@ include("loader.jl")
 # Identity stamping (nonce + self-consistent CRC) and pre-load verification
 include("identity.jl")
 
+# Reference translation (sidecar emit / consumer translate / canonicalize)
+include("translate.jl")
+
 # Optional monkey-patch mode
 include("hooks.jl")
 
@@ -65,6 +69,8 @@ export PkgImageHeader, WorklistEntry, DepModEntry
 export RemapSpec
 export VerificationReport, ProtectionReport
 export ClosureReport, MissingDep
+export RefDescriptor, RefTarget, ImageSidecar, Sidecar
+export TranslationReport, CanonicalizeReport
 
 # Header
 export parse_header, inspect
@@ -77,6 +83,10 @@ export load_package_image, resolve_dep, resolve_all_deps, verify_closure
 
 # Identity stamping + verification
 export stamp_identity!, dry_verify
+
+# Reference translation
+export emit_sidecar, translate!, canonicalize!, load_translated
+export write_sidecar, read_sidecar
 
 # Hooks
 export install_hooks!, uninstall_hooks!

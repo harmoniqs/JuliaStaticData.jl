@@ -181,6 +181,202 @@ struct ClosureReport
     messages::Vector{String}
 end
 
+# ── Reference-translation types ──────────────────────────────
+
+"""
+    RefDescriptor
+
+A **semantic** description of the object a private image's external reference
+points at, in a *dependency* package image. Emitted by [`emit_sidecar`](@ref) on
+the builder side (via live reflection) and resolved back to a live object by
+[`translate!`](@ref) on the consumer side, so a ref word can be re-pointed at the
+consumer's own rebuild of the dep without any blob archaeology.
+
+The design finding of the bundle-v2 pipeline (leg5): 283/283 real targets are
+semantically stable entities. `RefDescriptor` encodes them by *kind*:
+
+- `:module`   — a dep root module or submodule. Resolved via
+  `Base.root_module(PkgId)` then a `modpath` submodule walk.
+- `:binding`  — a `Core.Binding`. Resolved via `jl_get_module_binding(owner, name)`.
+- `:type`     — a named `DataType`/`UnionAll` bound to `name` in its module
+  (resolved via `getglobal`).
+- `:typename` — a `Core.TypeName`. Resolved as `Base.unwrap_unionall(T).name`
+  for the named type `T`.
+- `:function` — a function / singleton instance (resolved via `getglobal`).
+- `:anchor`   — an anonymous object (`SimpleVector`, `UnionAll`, a cached tuple,
+  a method signature) that has no name of its own but IS reachable from a named
+  owner by a deterministic (build-stable) field path. Described as a named `owner`
+  descriptor plus a `fieldpath` walked from that owner to the target. This is
+  leg5's "nearest named owner + field path" semantics.
+- `:svec_content` — an anonymous `Core.SimpleVector` (format-spec / method-sig /
+  type-cache svec, e.g. `svec(Val{'f'})`, `svec('e')`) with **no** deterministic
+  field path, because the type-cache ordering that reaches it is build-volatile
+  (leg5 RESULTS §6). Described **order-independently** by its per-element content:
+  `payload` is a serialized `Vector` of the elements (each a `Type` or an
+  isbits/Symbol/String leaf — semantically stable, reconstructible consumer-side).
+  Resolved by reconstructing the element values and locating the live in-blob svec
+  whose content matches structurally (mutual subtyping for type elements). When two
+  structurally-identical svecs share the blob, `rank`/`cohort` pin the right one by
+  blob order within the equal-content cohort.
+- `:const_data` — a const-data-region object with no gctag boundary and no name
+  (measured: interned `String`s such as error messages). Described by its value
+  (`payload` = serialized value); resolved by scanning the consumer dep's const
+  region for the object's byte image (`[len][bytes][NUL]` for a `String`),
+  `rank`/`cohort` disambiguating duplicates.
+
+# Fields
+- `kind`: one of the symbols above
+- `modpath`: submodule path from the dep root module (`Symbol[]` = the root itself)
+- `name`: binding / type / typename / function name (unused, `Symbol("")`, for
+  `:module`, `:anchor`, `:svec_content`, `:const_data`)
+- `owner`: for `:anchor`, the named descriptor of the object to start walking
+  from; `nothing` for the other kinds
+- `fieldpath`: for `:anchor`, the ordered walk steps `(op, arg)` where `op` is
+  `:getfield` (`getfield(cur, arg)`), `:getindex` (`cur[arg]`, e.g. a
+  `SimpleVector`), or `:property` (`getproperty(cur, arg)`, e.g. `T.parameters`)
+- `payload`: for `:svec_content` / `:const_data`, the `Serialization` bytes of the
+  content (svec element `Vector`, or the const value); empty (`UInt8[]`) otherwise.
+  Kept as raw bytes so the sidecar itself deserializes without any dep module
+  loaded — the content is unpacked only during resolution, after the deps are
+  `Base.require`d.
+- `rank`, `cohort`: for content-matched kinds, the 1-based position of the target
+  within its equal-content cohort (sorted by builder blob offset) and that cohort's
+  size, so a consumer with the same cohort can pick the corresponding member
+  deterministically. `0` when not applicable (named/anchor kinds, or a unique match).
+"""
+struct RefDescriptor
+    kind::Symbol
+    modpath::Vector{Symbol}
+    name::Symbol
+    owner::Union{RefDescriptor, Nothing}
+    fieldpath::Vector{Tuple{Symbol, Any}}
+    payload::Vector{UInt8}
+    rank::Int
+    cohort::Int
+end
+
+RefDescriptor(kind::Symbol, modpath::Vector{Symbol}, name::Symbol) =
+    RefDescriptor(kind, modpath, name, nothing, Tuple{Symbol, Any}[], UInt8[], 0, 0)
+
+RefDescriptor(kind::Symbol, modpath::Vector{Symbol}, name::Symbol,
+              owner::Union{RefDescriptor, Nothing},
+              fieldpath::Vector{Tuple{Symbol, Any}}) =
+    RefDescriptor(kind, modpath, name, owner, fieldpath, UInt8[], 0, 0)
+
+"""
+    RefTarget
+
+One distinct external-reference *target* in a private package image: a
+`(depsidx, old_offset)` position in a dependency's linkage blob, the
+[`RefDescriptor`](@ref) that names the live object there, and the payload
+positions of every ref word that points at it (recorded for integrity).
+
+# Fields
+- `depsidx`: 1-based index into the image's `required_modules` (leg5 law:
+  `depsidx d ≥ 1` = `required_modules[d]`; `depsidx 0` = sysimage, never a target)
+- `dep_name`, `dep_uuid`: identity of the dependency the target lives in
+- `old_offset`: byte offset of the target object into the dep's linkage blob, as
+  seen on the builder side
+- `descriptor`: the semantic description of the target object
+- `expected_word`: the raw 64-bit ref word the builder saw (integrity check)
+- `positions`: payload byte positions of the ref words pointing here
+"""
+struct RefTarget
+    depsidx::Int
+    dep_name::String
+    dep_uuid::UInt128
+    old_offset::Int
+    descriptor::RefDescriptor
+    expected_word::UInt64
+    positions::Vector{Int}
+end
+
+"""
+    ImageSidecar
+
+The reference-translation sidecar for a single private package image: enough
+semantic information for a consumer to re-point every cross-image reference at
+its own rebuild of the dependencies. See [`emit_sidecar`](@ref).
+
+# Fields
+- `image_name`, `image_uuid`: identity of the private image (its worklist module)
+- `julia_version`: the Julia version the sidecar was emitted under (translation
+  is only valid for a byte-identical Julia)
+- `n_words`: total pkgimage-dep ref words found in the image
+- `targets`: the distinct [`RefTarget`](@ref)s (deduplicated by `depsidx`/offset)
+"""
+struct ImageSidecar
+    image_name::String
+    image_uuid::UInt128
+    julia_version::String
+    n_words::Int
+    targets::Vector{RefTarget}
+end
+
+"""
+    Sidecar
+
+A reference-translation sidecar covering one or more private package images (see
+[`emit_sidecar`](@ref), [`write_sidecar`](@ref), [`read_sidecar`](@ref)).
+"""
+struct Sidecar
+    version::Int
+    images::Vector{ImageSidecar}
+end
+
+"""
+    TranslationReport
+
+Result of [`translate!`](@ref) on one private image: how many ref words were
+checked, how many were actually rewritten (only targets whose offset shifted
+between builds change), which targets could not be resolved, and the new
+self-consistent checksum.
+
+# Fields
+- `image`: path of the translated image
+- `words_checked`: pkgimage-dep ref words examined
+- `words_rewritten`, `words_unchanged`: split of `words_checked`
+- `targets_resolved`: distinct targets resolved to a live consumer object
+- `targets_failed`: human-readable descriptions of targets that could not be
+  resolved (empty ⟺ full success)
+- `old_checksum`, `new_checksum`: the image's embedded checksum before/after restamp
+- `ok`: `true` iff every target resolved and the image was restamped
+"""
+struct TranslationReport
+    image::String
+    words_checked::Int
+    words_rewritten::Int
+    words_unchanged::Int
+    targets_resolved::Int
+    targets_failed::Vector{String}
+    old_checksum::UInt64
+    new_checksum::UInt64
+    ok::Bool
+end
+
+"""
+    CanonicalizeReport
+
+Result of [`canonicalize!`](@ref): the post-load type-hash repair pass over a
+freshly translated private module tree. Because `TypeName` hashes are salted with
+the *builder's* per-build module nonce (`datatype.c:84`), a translated image's own
+method signatures carry stale baked type hashes that break hash-consulting
+dispatch paths; this pass re-interns them through live consumer-side constructors.
+
+# Fields
+- `methods_scanned`: private methods examined
+- `sigs_reinterned`: signatures whose interned identity changed (pointer compare)
+- `entries_reinserted`: dispatch entries re-inserted because the method table
+  could no longer find the method for its own canonical signature
+- `modules`: names of the private modules that were scanned
+"""
+struct CanonicalizeReport
+    methods_scanned::Int
+    sigs_reinterned::Int
+    entries_reinserted::Int
+    modules::Vector{String}
+end
+
 # ── Protection analysis types ───────────────────────────────
 
 """
